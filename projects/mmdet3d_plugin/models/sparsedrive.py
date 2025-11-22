@@ -195,8 +195,8 @@ class PVReconVAE(nn.Module):
         assert cam_mask is not None, "PVReconVAE 需要 cam_mask（可以全 0）"
 
         outs = []
-        total_rec_loss = 0.0
-        total_kl_loss = 0.0
+        total_rec_loss = None
+        total_kl_loss = None
         B_mask, V_mask = cam_mask.shape
 
         for i, F in enumerate(feature_maps):
@@ -240,8 +240,12 @@ class PVReconVAE(nn.Module):
                 else:
                     kl_loss = kl.mean()
 
-                total_rec_loss = total_rec_loss + rec_loss
-                total_kl_loss = total_kl_loss + kl_loss
+                total_rec_loss = (
+                    rec_loss if total_rec_loss is None else total_rec_loss + rec_loss
+                )
+                total_kl_loss = (
+                    kl_loss if total_kl_loss is None else total_kl_loss + kl_loss
+                )
 
                 outs.append(F)
             else:
@@ -258,12 +262,14 @@ class PVReconVAE(nn.Module):
         else:
             ref_device = torch.device("cpu")
 
-        total_rec_loss = torch.as_tensor(
-            total_rec_loss, device=ref_device, dtype=torch.float32
-        )
-        total_kl_loss = torch.as_tensor(
-            total_kl_loss, device=ref_device, dtype=torch.float32
-        )
+        if total_rec_loss is None:
+            total_rec_loss = torch.zeros(
+                1, device=ref_device, dtype=torch.float32
+            ).sum()
+        if total_kl_loss is None:
+            total_kl_loss = torch.zeros(
+                1, device=ref_device, dtype=torch.float32
+            ).sum()
 
         loss_dict = {
             "loss_pv_vae_rec": self.lambda_rec * total_rec_loss,
@@ -296,7 +302,7 @@ class SparseDrive(BaseDetector):
         self.test_cfg = test_cfg
 
         if pretrained is not None:
-            backbone.pretrained = pretrained  # type: ignore[name-defined]
+            img_backbone.pretrained = pretrained
 
         self.img_backbone = build_backbone(img_backbone)
         if img_neck is not None:
