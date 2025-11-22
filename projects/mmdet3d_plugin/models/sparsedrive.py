@@ -212,7 +212,8 @@ class PVReconVAE(nn.Module):
                 keep = 1.0 - miss
 
                 # 仅在 miss==1 的视角位置，将输入特征置 0，模拟“特征缺失”
-                F_in = F * keep  # [B, V, C, H, W]
+                # detach 避免 VAE loss 反向传播到主干特征
+                F_in = (F * keep).detach()  # [B, V, C, H, W]
 
                 # 展平视角维度喂入 VAE
                 F_in_flat = F_in.view(B * V, C, H, W)
