@@ -2,7 +2,7 @@ from inspect import signature
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as function
+import torch.nn.functional as F
 
 from mmcv.runner import force_fp32, auto_fp16
 from mmcv.utils import build_from_cfg
@@ -14,7 +14,6 @@ from mmdet.models import (
     build_head,
     build_neck,
 )
-
 from .grid_mask import GridMask
 
 try:
@@ -25,11 +24,11 @@ except Exception:
 
 __all__ = ["SparseDrive"]
 
-from einops import rearrange
+from einops import rearrange  # 目前未用到，保留
 
 
 # ================================
-# 1) 随机相机失效（仅用于采样 cam_mask）
+# 1) 随机相机失效（可复现）
 # ================================
 class RandCamMask(torch.nn.Module):
     r"""
@@ -40,18 +39,16 @@ class RandCamMask(torch.nn.Module):
         train_only: bool    True=>仅训练期启用，False=>推理期也启用
         seed      : int     随机种子，保证遮挡可复现
     Input / Output
-        x :  [B, V, C, H, W]  float32
+        x :  [B, V, 3, H, W]  float32  (0~1)
     Return
-        (x_masked, cam_mask)  其中 cam_mask: [B, V] bool，True=该相机被“选中缺失”
+        (x_masked, cam_mask)  其中 cam_mask: [B, V] bool，True=该相机被遮
     """
-    def __init__(
-        self,
-        p_missing: float = 0.5,
-        n_min: int = 1,
-        n_max: int = 2,
-        train_only: bool = True,
-        seed: int = 42,
-    ):
+    def __init__(self,
+                 p_missing=0.5,
+                 n_min=1,
+                 n_max=2,
+                 train_only=True,
+                 seed: int = 42):
         super().__init__()
         assert 0.0 <= p_missing <= 1.0
         assert 1 <= n_min <= n_max
@@ -99,21 +96,21 @@ class RandCamMask(torch.nn.Module):
                 )[:n_drop]
                 cam_mask[b, drop_ids] = True
 
-        # 这里虽然返回了 x_masked，但在方案 B 中，我们只真正用 cam_mask
+        # 应用遮挡（被遮挡视角直接置 0）
         x = x * (~cam_mask).view(B, N_cam, 1, 1, 1).to(x.dtype)
         return (x, cam_mask) if return_mask else x
 
 
 # ===========================================
-# 2) 视角级特征 VAE（单尺度）
+# 2) 视角级特征补全（VAE）
 # ===========================================
 class SimpleFeatureVAE(nn.Module):
     """
-    一个简单的卷积 VAE，用于对单尺度特征图做重建：
-      - 输入:  [B, C, H, W]
-      - 输出:  x_rec, mu, logvar  其中 x_rec 与输入同形状
+    一个轻量卷积 VAE，用在单尺度特征图上：
+      输入:  [B, C, H, W]
+      输出:  [B, C, H, W]  (重建特征), 以及 mu, logvar
     """
-    def __init__(self, in_channels: int, latent_channels: int = 64):
+    def __init__(self, in_channels, latent_channels=64):
         super().__init__()
         # encoder
         self.enc = nn.Sequential(
@@ -124,6 +121,7 @@ class SimpleFeatureVAE(nn.Module):
         # 变分瓶颈
         self.mu_conv = nn.Conv2d(latent_channels, latent_channels, 1, bias=True)
         self.logvar_conv = nn.Conv2d(latent_channels, latent_channels, 1, bias=True)
+
         # decoder
         self.dec = nn.Sequential(
             nn.Conv2d(latent_channels, latent_channels, 3, padding=1, bias=False),
@@ -149,6 +147,9 @@ class SimpleFeatureVAE(nn.Module):
     def forward(self, x):
         """
         x: [B, C, H, W]
+        return:
+          x_rec: [B, C, H, W]
+          mu, logvar: [B, C_latent, H, W]
         """
         mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
@@ -156,121 +157,69 @@ class SimpleFeatureVAE(nn.Module):
         return x_rec, mu, logvar
 
 
-# ===========================================
-# 3) 多尺度、多视角 VAE 自监督模块（方案 B）
-# ===========================================
 class PVReconVAE(nn.Module):
     """
-    多尺度、多视角 VAE 自监督补全模块（方案 B）：
-    - 不在图像上做缺失，只在特征层做 masked reconstruction
-    - target 是完整特征 F.detach()，mask 后输入 VAE 重建
-    - loss 只在 cam_mask=True 的视角上计算
+    多尺度、多视角 VAE 补全模块
+
+    输入:
+      feature_maps: List[Tensor]，每尺度 [B, V, C, H, W]
+      cam_mask    : [B, V] bool，True=该视角缺失
+
+    输出:
+      outs        : List[Tensor]，与 feature_maps 同形状，
+                    cam_mask=True 的位置用 VAE 重建特征替换
+      loss_dict   : {'loss_pv_vae_rec': ..., 'loss_pv_vae_kl': ...}
     """
-    def __init__(
-        self,
-        ch_per_scale,
-        latent_channels: int = 64,
-        lambda_rec: float = 1.0,
-        lambda_kl: float = 1e-4,
-    ):
+    def __init__(self,
+                 ch_per_scale,
+                 latent_channels=64,
+                 lambda_rec=1.0,
+                 lambda_kl=1e-4):
         super().__init__()
         assert isinstance(ch_per_scale, (list, tuple))
-        self.vaes = nn.ModuleList(
-            [SimpleFeatureVAE(c, latent_channels=latent_channels) for c in ch_per_scale]
-        )
+        self.vaes = nn.ModuleList([
+            SimpleFeatureVAE(c, latent_channels=latent_channels)
+            for c in ch_per_scale
+        ])
         self.lambda_rec = lambda_rec
         self.lambda_kl = lambda_kl
 
     def forward(self, feature_maps, cam_mask, metas=None):
-        """
-        Args:
-            feature_maps: list of tensors
-                其中我们只对形状为 [B, V, C, H, W] 的层做自监督
-            cam_mask    : [B, V] bool，True 表示该视角“被当作缺失”，
-                          仅在这些位置计算重建 + KL 损失
-        Returns:
-            outs:      list of 原始 feature_maps（当前版本不改动，只算 loss）
-            loss_dict: {'loss_pv_vae_rec': ..., 'loss_pv_vae_kl': ...}
-        """
         assert cam_mask is not None, "PVReconVAE 需要 cam_mask（可以全 0）"
-
-        outs = []
-        total_rec_loss = None
-        total_kl_loss = None
         B_mask, V_mask = cam_mask.shape
+        outs = []
 
-        for i, F in enumerate(feature_maps):
-            # 只在 5D 特征上做多视角自监督，其它维度（比如 4D/3D）直接略过
-            if F.dim() == 5:
-                B, V, C, H, W = F.shape
-                assert B == B_mask and V == V_mask, "cam_mask 维度需与特征一致"
+        total_rec_loss = 0.0
+        total_kl_loss = 0.0
 
-                F_target = F.detach()  # 完整特征作为重建 target
+        for i, Fm in enumerate(feature_maps):
+            # Fm: [B, V, C, H, W]
+            B, V, C, H, W = Fm.shape
+            assert B == B_mask and V == V_mask, "cam_mask 维度需与特征一致"
 
-                # 构造 mask：True=缺失，需要重建
-                miss = cam_mask.view(B, V, 1, 1, 1).to(F.dtype)  # [B,V,1,1,1]
-                keep = 1.0 - miss
+            # 展平视角维度，喂入 VAE
+            F_in = Fm.view(B * V, C, H, W)           # [B*V, C, H, W]
+            F_detach = F_in.detach()                 # 只训练 VAE，不回传到 backbone
 
-                # 仅在 miss==1 的视角位置，将输入特征置 0，模拟“特征缺失”
-                # detach 避免 VAE loss 反向传播到主干特征
-                F_in = (F * keep).detach()  # [B, V, C, H, W]
+            x_rec, mu, logvar = self.vaes[i](F_in)   # [B*V, C, H, W], [B*V, C_lat, H, W]
 
-                # 展平视角维度喂入 VAE
-                F_in_flat = F_in.view(B * V, C, H, W)
-                x_rec, mu, logvar = self.vaes[i](F_in_flat)
+            # ---------- VAE 损失 ----------
+            # 重建损失：MSE
+            rec_loss = F.mse_loss(x_rec, F_detach)
 
-                # 还原视角维
-                F_rec = x_rec.view(B, V, C, H, W)
+            # KL 散度（per-pixel）
+            kl = 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar)
+            kl_loss = kl.mean()
 
-                # ========= 重建误差（只在 miss==1 的位置上算） =========
-                num_missing = miss.sum()
-                if num_missing > 0:
-                    diff = (F_rec - F_target) ** 2  # [B,V,C,H,W]
-                    rec_loss = (diff * miss).sum() / (num_missing * C * H * W)
-                else:
-                    rec_loss = function.mse_loss(F_rec, F_target)
+            total_rec_loss = total_rec_loss + rec_loss
+            total_kl_loss = total_kl_loss + kl_loss
 
-                # ========= KL 散度（同样只在 miss==1 上统计平均） =========
-                kl = 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar)  # [B*V,Lat,H,W]
-                Bv, Lat, Hk, Wk = kl.shape
-                kl = kl.view(B, V, Lat, Hk, Wk)
-                if num_missing > 0:
-                    kl_loss = (
-                        kl * miss.view(B, V, 1, 1, 1)
-                    ).sum() / (num_missing * Lat * Hk * Wk)
-                else:
-                    kl_loss = kl.mean()
+            # ---------- 视角级补全 ----------
+            F_rec = x_rec.view(B, V, C, H, W)
+            miss = cam_mask.view(B, V, 1, 1, 1).to(Fm.dtype)  # 1=缺失
+            F_out = Fm * (1.0 - miss) + F_rec * miss
 
-                total_rec_loss = (
-                    rec_loss if total_rec_loss is None else total_rec_loss + rec_loss
-                )
-                total_kl_loss = (
-                    kl_loss if total_kl_loss is None else total_kl_loss + kl_loss
-                )
-
-                outs.append(F)
-            else:
-                # 比如某些特殊层是 [B,C,H,W] 或 [C,H,W]，这里不做自监督，直接 passthrough
-                outs.append(F)
-
-        # 把 total_rec_loss / total_kl_loss 转成 tensor，避免某些 batch 是纯 float(0.0)
-        if isinstance(feature_maps, (list, tuple)) and len(feature_maps) > 0:
-            ref_feat = feature_maps[0]
-            if isinstance(ref_feat, torch.Tensor):
-                ref_device = ref_feat.device
-            else:
-                ref_device = torch.device("cpu")
-        else:
-            ref_device = torch.device("cpu")
-
-        if total_rec_loss is None:
-            total_rec_loss = torch.zeros(
-                1, device=ref_device, dtype=torch.float32
-            ).sum()
-        if total_kl_loss is None:
-            total_kl_loss = torch.zeros(
-                1, device=ref_device, dtype=torch.float32
-            ).sum()
+            outs.append(F_out)
 
         loss_dict = {
             "loss_pv_vae_rec": self.lambda_rec * total_rec_loss,
@@ -280,7 +229,7 @@ class PVReconVAE(nn.Module):
 
 
 # ============================
-# 4) 主模型：SparseDrive
+# 3) 主模型：接入 VAE + 自监督
 # ============================
 @DETECTORS.register_module()
 class SparseDrive(BaseDetector):
@@ -293,19 +242,18 @@ class SparseDrive(BaseDetector):
         train_cfg=None,
         test_cfg=None,
         pretrained=None,
-        use_grid_mask: bool = True,
-        use_deformable_func: bool = False,
+        use_grid_mask=True,
+        use_deformable_func=False,
         depth_branch=None,
+        ssl_weight=1.0,        # 自监督损失权重
     ):
         super(SparseDrive, self).__init__(init_cfg=init_cfg)
 
-        self.train_cfg = train_cfg
-        self.test_cfg = test_cfg
-
-        if pretrained is not None:
-            img_backbone.pretrained = pretrained
-
         self.img_backbone = build_backbone(img_backbone)
+        if pretrained is not None:
+            # 修正原代码里的 backbone 引用错误
+            self.img_backbone.pretrained = pretrained
+
         if img_neck is not None:
             self.img_neck = build_neck(img_neck)
         else:
@@ -328,18 +276,16 @@ class SparseDrive(BaseDetector):
                 True, True, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.7
             )
 
-        # ---------------- 随机相机“缺失” mask（训练用于自监督） ----------------
+        # 随机相机失效
         self.cam_dropout = RandCamMask(
-            p_missing=0.6,
-            n_min=1,
-            n_max=2,
-            train_only=True,
-            seed=42,
+            p_missing=0.6, n_min=1, n_max=2, train_only=False, seed=42
         )
 
-        # ------------ VAE 视角级特征自监督模块 ------------
-        # 注意：这里 ch_per_scale 要和 neck 输出通道对齐
-        # 例如 FPN 把通道统一到 256，则可以写 [256,256,256,256]
+        # 是否在 test 阶段模拟相机缺失
+        self.test_cam_missing = False  # 可在外部设置为 True
+
+        # VAE 视角级特征补全模块
+        # 注意 ch_per_scale 要和 neck 输出通道对齐
         self.pv_recon = PVReconVAE(
             ch_per_scale=[256, 256, 256, 256],
             latent_channels=64,
@@ -347,65 +293,158 @@ class SparseDrive(BaseDetector):
             lambda_kl=1e-4,
         )
 
-        # 用于在 forward_train 中取出 VAE loss
+        # 存储 VAE loss
         self.vae_loss_dict = None
 
+        # 自监督损失权重
+        self.ssl_weight = ssl_weight
+
+    # -----------------------
+    # 仅 backbone + neck 的特征提取
+    # -----------------------
     @auto_fp16(apply_to=("img",), out_fp32=True)
-    def extract_feat(self, img, return_depth: bool = False, metas=None):
-        """提取多尺度多视角特征（不在此处做 VAE 自监督）。"""
+    def _extract_backbone_neck(self, img, metas=None, enable_deform=False):
+        """
+        只跑 backbone + neck（可选 deformable），不做 VAE 补全、不算 depth。
+        输入 img: [B, V, 3, H, W] 或 [B, 3, H, W]
+        输出: list of [B, V, C, H, W]
+        """
         bs = img.shape[0]
-        if img.dim() == 5:  # multi-view
+        if img.dim() == 5:
             num_cams = img.shape[1]
-            img = img.flatten(end_dim=1)  # [B*V, 3, H, W]
+            img_flat = img.flatten(0, 1)  # [B*V, 3, H, W]
         else:
             num_cams = 1
+            img_flat = img
 
         if self.use_grid_mask:
-            img = self.grid_mask(img)
+            img_flat = self.grid_mask(img_flat)
 
-        # 有些 backbone 会显式接收 metas
         if "metas" in signature(self.img_backbone.forward).parameters:
-            feature_maps = self.img_backbone(img, num_cams, metas=metas)
+            feats = self.img_backbone(img_flat, num_cams, metas=metas)
         else:
-            feature_maps = self.img_backbone(img)  # tuple
+            feats = self.img_backbone(img_flat)
 
         if self.img_neck is not None:
-            feature_maps = list(self.img_neck(feature_maps))  # list
+            feats = list(self.img_neck(feats))
+        else:
+            feats = list(feats) if isinstance(feats, (list, tuple)) else [feats]
 
-        # 展回 [B, V, C, H, W]（如果原来就是 4D/其它维度则保持不动）
-        fm_list = []
-        for feat in feature_maps:
-            if feat.dim() == 4:
-                fm_list.append(
-                    torch.reshape(
-                        feat,
-                        (bs, num_cams) + feat.shape[1:],
-                    )
-                )
-            else:
-                fm_list.append(feat)
-        feature_maps = fm_list
+        # 还原成 [B, V, C, H, W]
+        for i, f in enumerate(feats):
+            feats[i] = f.view(bs, num_cams, *f.shape[1:])
 
-        # 可选：深度分支
+        if self.use_deformable_func and enable_deform:
+            feats = feature_maps_format(feats)
+
+        return feats
+
+    # -----------------------
+    # 推理/测试用的 extract_feat（带 VAE / depth）
+    # -----------------------
+    @auto_fp16(apply_to=("img",), out_fp32=True)
+    def extract_feat(self, img, return_depth=False, metas=None, cam_mask=None):
+        """
+        仅在 eval/test 中使用；训练阶段 forward_train 不走这条
+        """
+        self.vae_loss_dict = None  # 测试阶段不记录 VAE 损失
+
+        if self.training:
+            # 训练阶段不应调用这个接口
+            raise RuntimeError("extract_feat should not be used in training mode.")
+
+        bs = img.shape[0]
+        if img.dim() == 5:
+            num_cams = img.shape[1]
+            img_flat = img.flatten(0, 1)
+        else:
+            num_cams = 1
+            img_flat = img
+
+        if self.use_grid_mask:
+            img_flat = self.grid_mask(img_flat)
+
+        if "metas" in signature(self.img_backbone.forward).parameters:
+            feats = self.img_backbone(img_flat, num_cams, metas=metas)
+        else:
+            feats = self.img_backbone(img_flat)
+
+        if self.img_neck is not None:
+            feats = list(self.img_neck(feats))
+        else:
+            feats = list(feats) if isinstance(feats, (list, tuple)) else [feats]
+
+        # 还原成 [B, V, C, H, W]
+        for i, f in enumerate(feats):
+            feats[i] = f.view(bs, num_cams, *f.shape[1:])
+
+        # 测试阶段若 cam_mask 有 True，可以用 VAE 补全
+        if cam_mask is not None:
+            cam_mask = cam_mask.to(feats[0].device, dtype=torch.bool)
+            if cam_mask.any():
+                feats, _ = self.pv_recon(feats, cam_mask, metas)
+
+        depths = None
         if return_depth and self.depth_branch is not None:
             focal = None
-            if isinstance(metas, dict):
+            if metas is not None and isinstance(metas, dict):
                 focal = metas.get("focal", None)
-            if isinstance(metas, (list, tuple)) and len(metas) > 0 and isinstance(
-                metas[0], dict
-            ):
-                focal = metas[0].get("focal", None)
-            depths = self.depth_branch(feature_maps, focal)
-        else:
-            depths = None
+            depths = self.depth_branch(feats, focal)
 
         if self.use_deformable_func:
-            feature_maps = feature_maps_format(feature_maps)
+            feats = feature_maps_format(feats)
 
         if return_depth:
-            return feature_maps, depths
-        return feature_maps
+            return feats, depths
+        return feats
 
+    # -----------------------
+    # 自监督损失（特征一致性）
+    # -----------------------
+    def compute_ssl_loss(self, feats_full, feats_masked, cam_mask):
+        """
+        feats_full   : list of [B, V, C, H, W]，来自 full images（no_grad）
+        feats_masked : list of [B, V, C, H, W]，来自 masked images（带梯度）
+        cam_mask     : [B, V] bool，True=该相机被 blackout
+        损失：仅在 cam_mask=True 的视角上，对齐 masked 与 full 的特征（MSE）
+        """
+        if cam_mask is None or (not cam_mask.any()):
+            return feats_masked[0].new_tensor(0.0)
+
+        cam_mask = cam_mask.to(feats_masked[0].device)
+        B, V = cam_mask.shape
+        mask = cam_mask.view(B, V, 1, 1, 1).float()  # [B,V,1,1,1]
+
+        total_loss = 0.0
+        num_scales = 0
+
+        for f_full, f_mask in zip(feats_full, feats_masked):
+            if f_full.dim() != 5 or f_mask.dim() != 5:
+                continue
+
+            Bf, Vf, C, H, W = f_full.shape
+            if Bf != B or Vf != V:
+                continue
+
+            diff = (f_mask - f_full) ** 2  # [B,V,C,H,W]
+            masked_diff = diff * mask
+            valid = mask.sum()  # 被遮挡的 (B,V) 视角数
+
+            if valid > 0:
+                loss_scale = masked_diff.sum() / (valid * C * H * W)
+                total_loss = total_loss + loss_scale
+                num_scales += 1
+
+        if num_scales > 0:
+            total_loss = total_loss / num_scales
+        else:
+            total_loss = feats_masked[0].new_tensor(0.0)
+
+        return total_loss * self.ssl_weight
+
+    # -----------------------
+    # 主 forward
+    # -----------------------
     @force_fp32(apply_to=("img",))
     def forward(self, img, **data):
         if self.training:
@@ -413,59 +452,72 @@ class SparseDrive(BaseDetector):
         else:
             return self.forward_test(img, **data)
 
+    # -----------------------
+    # 训练前向：带 SSL + VAE
+    # -----------------------
     def forward_train(self, img, **data):
-        """训练阶段：主任务 + 特征层 VAE 自监督（方案 B）。"""
         # img: [B, V, 3, H, W]
+        B, V = img.shape[:2]
 
-        # 1) 提取完整多视角特征（不对图像做 dropout）
-        feature_maps, depths = self.extract_feat(
-            img,
-            return_depth=True,
-            metas=data,
-        )
+        # 1) 保留一份 full images，用于 SSL teacher
+        img_full = img.clone()
 
-        # 2) 使用 RandCamMask 仅采样 cam_mask（不改动特征 / 图像）
-        #    期望 cam_mask: [B, V] bool，True 表示该视角被当作“缺失”
-        B = feature_maps[0].shape[0]
-        V = feature_maps[0].shape[1]
-        dummy = torch.zeros(
-            B,
-            V,
-            3,
-            1,
-            1,
-            device=feature_maps[0].device,
-            dtype=feature_maps[0].dtype,
-        )
-        _, cam_mask = self.cam_dropout(dummy, return_mask=True)
+        # 2) 随机相机遮挡，得到 masked images + cam_mask
+        img_masked, cam_mask = self.cam_dropout(img, return_mask=True)
+        cam_mask = cam_mask.to(img.device)
 
-        # 3) VAE 自监督：只用来计算 loss，不改动用于 head 的特征
-        if hasattr(self, "pv_recon") and self.pv_recon is not None:
-            detached_feature_maps = [
-                feat.detach() if isinstance(feat, torch.Tensor) else feat
-                for feat in feature_maps
-            ]
-            _, vae_loss = self.pv_recon(detached_feature_maps, cam_mask, metas=data)
-            self.vae_loss_dict = vae_loss
-        else:
-            self.vae_loss_dict = None
+        # 3) masked 分支：带梯度的 backbone+neck（student）
+        feats_mask_base = self._extract_backbone_neck(
+            img_masked, metas=data, enable_deform=False
+        )  # list of [B,V,C,H,W]
 
-        # 4) 主任务 head：仍使用完整 feature_maps
-        model_outs = self.head(feature_maps, data)
+        # 4) full 分支：no_grad 的 backbone+neck（teacher）
+        with torch.no_grad():
+            feats_full_base = self._extract_backbone_neck(
+                img_full, metas=data, enable_deform=False
+            )
+
+        # 5) 自监督损失：只对被 blackout 的视角做特征一致性
+        loss_ssl = self.compute_ssl_loss(feats_full_base, feats_mask_base, cam_mask)
+
+        # 6) VAE 视角补全：只作用在 masked 分支特征上
+        feature_maps, vae_loss = self.pv_recon(feats_mask_base, cam_mask, metas=data)
+        self.vae_loss_dict = vae_loss  # 用于后面合并 loss
+
+        # 7) 深度分支（如果有）
+        depths = None
+        if self.depth_branch is not None and "gt_depth" in data:
+            focal = None
+            if isinstance(data, dict):
+                focal = data.get("focal", None)
+            depths = self.depth_branch(feature_maps, focal)
+
+        # 8) deformable 聚合给 head 用
+        feats_for_head = feature_maps
+        if self.use_deformable_func:
+            feats_for_head = feature_maps_format(feats_for_head)
+
+        # 9) head 前向 + 监督 loss
+        model_outs = self.head(feats_for_head, data)
         output = self.head.loss(model_outs, data)
 
-        # 5) 深度监督（如有）
-        if depths is not None and "gt_depth" in data:
+        if depths is not None:
             output["loss_dense_depth"] = self.depth_branch.loss(
                 depths, data["gt_depth"]
             )
 
-        # 6) 合并 VAE 自监督损失
+        # 合并 VAE 损失
         if self.vae_loss_dict is not None:
             output.update(self.vae_loss_dict)
 
+        # 合并自监督损失
+        output["loss_pv_ssl"] = loss_ssl
+
         return output
 
+    # -----------------------
+    # 测试前向
+    # -----------------------
     def forward_test(self, img, **data):
         if isinstance(img, list):
             return self.aug_test(img, **data)
@@ -473,10 +525,19 @@ class SparseDrive(BaseDetector):
             return self.simple_test(img, **data)
 
     def simple_test(self, img, **data):
+        cam_mask = None
+        # 仅在配置里开启时，才在测试阶段模拟相机缺失
+        if getattr(self, "test_cam_missing", False):
+            img, cam_mask = self.cam_dropout(img, return_mask=True)
+
         feature_maps = self.extract_feat(
             img,
             metas=data.get("img_metas", None),
+            cam_mask=cam_mask,
+            return_depth=False,
         )
+
+        # head 推理
         model_outs = self.head(feature_maps, data)
         results = self.head.post_process(model_outs, data)
         output = [{"img_bbox": result} for result in results]
@@ -484,7 +545,7 @@ class SparseDrive(BaseDetector):
 
     def aug_test(self, img, **data):
         # fake test time augmentation
-        for key in data.keys():
+        for key in list(data.keys()):
             if isinstance(data[key], list):
                 data[key] = data[key][0]
         return self.simple_test(img[0], **data)
