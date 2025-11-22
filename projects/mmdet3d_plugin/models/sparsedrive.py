@@ -441,7 +441,11 @@ class SparseDrive(BaseDetector):
 
         # 3) VAE 自监督：只用来计算 loss，不改动用于 head 的特征
         if hasattr(self, "pv_recon") and self.pv_recon is not None:
-            _, vae_loss = self.pv_recon(feature_maps, cam_mask, metas=data)
+            detached_feature_maps = [
+                feat.detach() if isinstance(feat, torch.Tensor) else feat
+                for feat in feature_maps
+            ]
+            _, vae_loss = self.pv_recon(detached_feature_maps, cam_mask, metas=data)
             self.vae_loss_dict = vae_loss
         else:
             self.vae_loss_dict = None
