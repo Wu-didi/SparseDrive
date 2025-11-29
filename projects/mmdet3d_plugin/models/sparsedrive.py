@@ -228,6 +228,183 @@ class PVReconVAE(nn.Module):
         return outs, loss_dict
 
 
+class LightDreamerRSSM(nn.Module):
+    """
+    轻量级 Dreamer/RSSM：把多视角特征聚合成 token 序列，按视角维度滚动，
+    预测缺失视角的稠密 token，并以 teacher（完整图像）特征监督。
+    """
+
+    def __init__(
+        self,
+        ch_per_scale,
+        deter_dim=128,
+        stoch_dim=32,
+        hidden_dim=128,
+        lambda_rec=1.0,
+        lambda_kl=1e-4,
+    ):
+        super().__init__()
+        if isinstance(ch_per_scale, (list, tuple)):
+            self.obs_dim = sum(ch_per_scale)
+        else:
+            self.obs_dim = int(ch_per_scale)
+        self.deter_dim = deter_dim
+        self.stoch_dim = stoch_dim
+        self.lambda_rec = lambda_rec
+        self.lambda_kl = lambda_kl
+
+        self.obs_encoder = nn.Sequential(
+            nn.Linear(self.obs_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(inplace=True),
+        )
+        self.prior_net = nn.Sequential(
+            nn.Linear(deter_dim, hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden_dim, 2 * stoch_dim),
+        )
+        self.post_net = nn.Sequential(
+            nn.Linear(deter_dim + hidden_dim, hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden_dim, 2 * stoch_dim),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(deter_dim + stoch_dim, hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden_dim, self.obs_dim),
+        )
+        self.gru = nn.GRUCell(stoch_dim, deter_dim)
+
+    def _pool_multi_scale(self, feats):
+        """
+        feats: list[Tensor] -> List[[B,V,C,H,W]]
+        return [B,V,obs_dim]
+        """
+        pooled = []
+        for feat in feats:
+            if not torch.is_tensor(feat):
+                continue
+            if feat.dim() == 5:
+                pooled.append(feat.mean(dim=(-1, -2)))
+            elif feat.dim() == 4:
+                pooled.append(feat.mean(dim=(-1, -2)).unsqueeze(1))
+        if len(pooled) == 0:
+            return None
+        return torch.cat(pooled, dim=-1)
+
+    @staticmethod
+    def _split_stats(stats):
+        mu, logvar = stats.chunk(2, dim=-1)
+        return mu, logvar
+
+    @staticmethod
+    def _reparameterize(mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    @staticmethod
+    def _kl_normal(mu_q, logvar_q, mu_p, logvar_p, eps=1e-5):
+        var_q = (logvar_q.exp()).clamp_min(eps)
+        var_p = (logvar_p.exp()).clamp_min(eps)
+        kl = 0.5 * (
+            (var_q + (mu_q - mu_p) ** 2) / var_p
+            - 1.0
+            + logvar_p
+            - logvar_q
+        )
+        return kl.sum(dim=-1, keepdim=True)
+
+    def _rollout(self, obs_tokens, target_tokens, cam_mask=None):
+        B, T, _ = obs_tokens.shape
+        deter = obs_tokens.new_zeros(B, self.deter_dim)
+        rec_loss = obs_tokens.new_zeros(())
+        kl_loss = obs_tokens.new_zeros(())
+        rec_steps = 0.0
+        kl_steps = 0.0
+
+        for t in range(T):
+            obs_t = obs_tokens[:, t]
+            target_t = target_tokens[:, t]
+
+            obs_embed = self.obs_encoder(obs_t)
+            prior_mu, prior_logvar = self._split_stats(self.prior_net(deter))
+            post_inp = torch.cat([deter, obs_embed], dim=-1)
+            post_mu, post_logvar = self._split_stats(self.post_net(post_inp))
+
+            if cam_mask is not None:
+                mask_t = cam_mask[:, t].float().unsqueeze(-1)
+                use_prior = mask_t.bool().expand_as(prior_mu)
+                z_post = self._reparameterize(post_mu, post_logvar)
+                z_prior = self._reparameterize(prior_mu, prior_logvar)
+                z = torch.where(use_prior, z_prior, z_post)
+            else:
+                mask_t = None
+                z = self._reparameterize(post_mu, post_logvar)
+
+            deter = self.gru(z, deter)
+            decoded = self.decoder(torch.cat([deter, z], dim=-1))
+
+            recon = F.mse_loss(
+                decoded, target_t.detach(), reduction="none"
+            ).mean(dim=-1, keepdim=True)
+            if mask_t is None:
+                rec_loss = rec_loss + recon.mean()
+                rec_steps += 1.0
+            else:
+                miss = mask_t
+                miss_sum = miss.sum()
+                if miss_sum > 0:
+                    rec_loss = rec_loss + (recon * miss).sum() / miss_sum
+                    rec_steps += 1.0
+
+            if mask_t is None:
+                kl = self._kl_normal(post_mu, post_logvar, prior_mu, prior_logvar)
+                kl_loss = kl_loss + kl.mean()
+                kl_steps += 1.0
+            else:
+                obs_mask = 1.0 - mask_t
+                obs_sum = obs_mask.sum()
+                if obs_sum > 0:
+                    kl = self._kl_normal(
+                        post_mu, post_logvar, prior_mu, prior_logvar
+                    )
+                    kl_loss = kl_loss + (kl * obs_mask).sum() / obs_sum
+                    kl_steps += 1.0
+
+        rec_den = obs_tokens.new_tensor(rec_steps if rec_steps > 0 else 1.0)
+        kl_den = obs_tokens.new_tensor(kl_steps if kl_steps > 0 else 1.0)
+        rec_loss = rec_loss / rec_den
+        kl_loss = kl_loss / kl_den
+        return rec_loss, kl_loss
+
+    def forward(self, student_feats, teacher_feats, cam_mask=None):
+        student_tokens = self._pool_multi_scale(student_feats)
+        teacher_tokens = self._pool_multi_scale(teacher_feats)
+        if student_tokens is None or teacher_tokens is None:
+            return None
+
+        if student_tokens.shape != teacher_tokens.shape:
+            raise ValueError(
+                f"student_tokens shape {student_tokens.shape} != teacher_tokens {teacher_tokens.shape}"
+            )
+
+        if cam_mask is not None:
+            cam_mask = cam_mask.to(student_tokens.device, dtype=torch.bool)
+            if cam_mask.dim() != 2:
+                raise ValueError("cam_mask should be [B, V]")
+
+        rec_loss, kl_loss = self._rollout(
+            student_tokens, teacher_tokens.detach(), cam_mask
+        )
+        return {
+            "loss_world_rec": rec_loss * self.lambda_rec,
+            "loss_world_kl": kl_loss * self.lambda_kl,
+        }
+
+
 # ============================
 # 3) 主模型：接入 VAE + 自监督
 # ============================
@@ -246,6 +423,7 @@ class SparseDrive(BaseDetector):
         use_deformable_func=False,
         depth_branch=None,
         ssl_weight=1.0,        # 自监督损失权重
+        world_model_cfg=None,  # Dreamer 风格潜世界模型
     ):
         super(SparseDrive, self).__init__(init_cfg=init_cfg)
 
@@ -298,6 +476,23 @@ class SparseDrive(BaseDetector):
 
         # 自监督损失权重
         self.ssl_weight = ssl_weight
+
+        # 轻量 Dreamer 世界模型
+        enable_world_model = True
+        if world_model_cfg is None:
+            world_model_cfg = dict(
+                ch_per_scale=[256, 256, 256, 256],
+                deter_dim=128,
+                stoch_dim=32,
+                hidden_dim=128,
+                lambda_rec=1.0,
+                lambda_kl=1e-4,
+            )
+        else:
+            enable_world_model = world_model_cfg.pop("enabled", True)
+        self.world_model = (
+            LightDreamerRSSM(**world_model_cfg) if enable_world_model else None
+        )
 
     # -----------------------
     # 仅 backbone + neck 的特征提取
@@ -480,6 +675,13 @@ class SparseDrive(BaseDetector):
         # 5) 自监督损失：只对被 blackout 的视角做特征一致性
         loss_ssl = self.compute_ssl_loss(feats_full_base, feats_mask_base, cam_mask)
 
+        # 5.1) Dreamer 风格潜世界模型监督
+        world_loss_dict = None
+        if self.world_model is not None:
+            world_loss_dict = self.world_model(
+                feats_mask_base, feats_full_base, cam_mask
+            )
+
         # 6) VAE 视角补全：只作用在 masked 分支特征上
         feature_maps, vae_loss = self.pv_recon(feats_mask_base, cam_mask, metas=data)
         self.vae_loss_dict = vae_loss  # 用于后面合并 loss
@@ -509,6 +711,9 @@ class SparseDrive(BaseDetector):
         # 合并 VAE 损失
         if self.vae_loss_dict is not None:
             output.update(self.vae_loss_dict)
+
+        if world_loss_dict is not None:
+            output.update(world_loss_dict)
 
         # 合并自监督损失
         output["loss_pv_ssl"] = loss_ssl

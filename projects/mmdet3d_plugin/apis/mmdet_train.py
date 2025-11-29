@@ -100,8 +100,6 @@ def custom_train_detector(
             broadcast_buffers=False,
             find_unused_parameters=find_unused_parameters,
         )
-        if hasattr(model, "_set_static_graph"):
-            model._set_static_graph()
 
     else:
         model = MMDataParallel(
