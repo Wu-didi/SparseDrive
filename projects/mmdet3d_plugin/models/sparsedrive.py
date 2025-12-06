@@ -654,6 +654,7 @@ class SparseDrive(BaseDetector):
         depth_branch=None,
         ssl_weight=1.0,        # 自监督损失权重
         world_model_cfg=None,  # Dreamer 风格潜世界模型
+        test_cam_missing=False,  # 测试时是否模拟相机缺失
     ):
         super(SparseDrive, self).__init__(init_cfg=init_cfg)
 
@@ -690,7 +691,7 @@ class SparseDrive(BaseDetector):
         )
 
         # 是否在 test 阶段模拟相机缺失
-        self.test_cam_missing = False  # 可在外部设置为 True
+        self.test_cam_missing = test_cam_missing
 
         # VAE 视角级特征补全模块
         # 注意 ch_per_scale 要和 neck 输出通道对齐
