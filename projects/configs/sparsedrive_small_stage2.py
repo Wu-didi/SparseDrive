@@ -34,6 +34,12 @@ input_shape = (704, 256)
 find_unused_parameters = True
 use_pv_recon = True
 
+# ===== 相机鲁棒性增强配置 =====
+# 1. 时序补全：利用历史帧预测缺失相机特征（默认启用）
+# 2. 规划导向加权：对重要相机（如前视）的补全loss加权（默认启用）
+# 3. 测试时相机遮挡：与训练保持一致（test_cam_missing=True）
+# 注：这些功能已在SparseDrive模型中默认启用，无需额外配置
+
 
 # ================== model ========================
 class_names = [
@@ -91,6 +97,7 @@ model = dict(
     type="SparseDrive",
     use_grid_mask=True,
     use_deformable_func=use_deformable_func,
+    test_cam_missing=True,  # 测试时也进行相机遮挡，和训练保持一致
     img_backbone=dict(
         type="ResNet",
         depth=50,

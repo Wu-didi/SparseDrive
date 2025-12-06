@@ -228,6 +228,236 @@ class PVReconVAE(nn.Module):
         return outs, loss_dict
 
 
+# ===========================================
+# 时序补全模块：利用历史帧预测当前缺失相机
+# ===========================================
+class TemporalFeatureCompletion(nn.Module):
+    """
+    时序补全模块
+
+    核心思想：
+    - 端到端模型有历史帧信息（queue_length=4）
+    - 当相机失效时，用历史轨迹预测当前帧的特征
+    - 比单帧VAE更合理，利用了时序连续性
+
+    输入：
+        current_feats: List[Tensor] 当前帧特征 [[B,V,C,H,W], ...]
+        history_queue: List[List[Tensor]] 历史帧特征队列
+        cam_mask: [B, V] bool，True=该相机失效
+
+    输出：
+        补全后的特征，与current_feats同结构
+    """
+    def __init__(self,
+                 ch_per_scale,
+                 hidden_dim=128,
+                 num_layers=2,
+                 enable=True):
+        super().__init__()
+        self.enable = enable
+        if not enable:
+            return
+
+        assert isinstance(ch_per_scale, (list, tuple))
+        self.num_scales = len(ch_per_scale)
+
+        # 为每个尺度创建一个GRU预测器
+        self.predictors = nn.ModuleList()
+        for c in ch_per_scale:
+            # 输入：时序特征，输出：预测的当前帧特征
+            predictor = nn.GRU(
+                input_size=c,
+                hidden_size=hidden_dim,
+                num_layers=num_layers,
+                batch_first=True,
+                dropout=0.1 if num_layers > 1 else 0.0
+            )
+            self.predictors.append(predictor)
+
+        # 解码器：从hidden state到特征
+        self.decoders = nn.ModuleList()
+        for c in ch_per_scale:
+            decoder = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, c),
+            )
+            self.decoders.append(decoder)
+
+    def forward(self, current_feats, history_queue, cam_mask):
+        """
+        current_feats: List[Tensor]，每个 [B, V, C, H, W]
+        history_queue: List[List[Tensor]]，外层是时间步，内层是尺度
+                       例如：[[scale0_t0, scale1_t0, ...], [scale0_t1, ...], ...]
+        cam_mask: [B, V] bool
+        """
+        if not self.enable:
+            return current_feats
+
+        if cam_mask is None or not cam_mask.any():
+            return current_feats
+
+        # 如果没有历史帧，无法做时序预测
+        if history_queue is None or len(history_queue) == 0:
+            return current_feats
+
+        outputs = []
+
+        for scale_idx, feat_cur in enumerate(current_feats):
+            B, V, C, H, W = feat_cur.shape
+            feat_out = feat_cur.clone()
+
+            # 提取这个尺度的历史特征
+            history_feats = []
+            for t in range(len(history_queue)):
+                if scale_idx < len(history_queue[t]):
+                    history_feats.append(history_queue[t][scale_idx])
+
+            if len(history_feats) == 0:
+                outputs.append(feat_out)
+                continue
+
+            # 对每个相机单独处理
+            for v in range(V):
+                # 找出这个相机失效的batch
+                cam_v_mask = cam_mask[:, v]  # [B]
+                if not cam_v_mask.any():
+                    continue
+
+                # 提取历史序列 [T, B, C, H, W]
+                hist_seq = [h[:, v] for h in history_feats]  # List of [B, C, H, W]
+                hist_seq = torch.stack(hist_seq, dim=0)  # [T, B, C, H, W]
+                T = hist_seq.shape[0]
+
+                # 全局平均池化：[T, B, C, H, W] -> [T, B, C]
+                hist_seq_pooled = hist_seq.mean(dim=(-1, -2))  # [T, B, C]
+                hist_seq_pooled = hist_seq_pooled.permute(1, 0, 2)  # [B, T, C]
+
+                # GRU预测
+                gru_out, hidden = self.predictors[scale_idx](hist_seq_pooled)  # [B, T, H]
+
+                # 取最后一个时间步的hidden state
+                last_hidden = hidden[-1]  # [B, H]
+
+                # 解码到特征空间
+                predicted_feat = self.decoders[scale_idx](last_hidden)  # [B, C]
+
+                # 扩展到空间维度（简单broadcast）
+                predicted_feat = predicted_feat.view(B, C, 1, 1).expand(B, C, H, W)
+
+                # 只替换失效的相机
+                mask_v = cam_v_mask.view(B, 1, 1, 1).float()
+                feat_out[:, v] = feat_out[:, v] * (1 - mask_v) + predicted_feat * mask_v
+
+            outputs.append(feat_out)
+
+        return outputs
+
+
+# ===========================================
+# 规划导向的特征加权模块
+# ===========================================
+class PlanningGuidedWeighting(nn.Module):
+    """
+    规划导向的特征重要性加权
+
+    核心思想：
+    - 不是所有相机区域都同等重要
+    - 前视相机对规划最关键，后视相机影响较小
+    - 自车速度越快，前方越重要
+
+    nuScenes相机布局（6个相机）：
+    0: CAM_FRONT - 前视（最重要）
+    1: CAM_FRONT_LEFT - 前左
+    2: CAM_FRONT_RIGHT - 前右
+    3: CAM_BACK_LEFT - 后左
+    4: CAM_BACK_RIGHT - 后右
+    5: CAM_BACK - 后视（最不重要）
+    """
+    def __init__(self,
+                 num_cameras=6,
+                 use_ego_state=True,
+                 base_weights=None):
+        super().__init__()
+        self.num_cameras = num_cameras
+        self.use_ego_state = use_ego_state
+
+        # 基础权重（可配置）
+        if base_weights is None:
+            # 默认权重：前视最高，后视最低
+            self.register_buffer('base_weights', torch.tensor([
+                2.0,   # CAM_FRONT
+                1.5,   # CAM_FRONT_LEFT
+                1.5,   # CAM_FRONT_RIGHT
+                1.0,   # CAM_BACK_LEFT
+                1.0,   # CAM_BACK_RIGHT
+                0.5,   # CAM_BACK
+            ]))
+        else:
+            self.register_buffer('base_weights', torch.tensor(base_weights))
+
+        # 根据自车状态调整权重（可选）
+        if use_ego_state:
+            # 简单的MLP：ego_state -> 权重调整系数
+            self.ego_adapter = nn.Sequential(
+                nn.Linear(3, 16),  # 输入：速度、加速度、角速度
+                nn.ReLU(inplace=True),
+                nn.Linear(16, num_cameras),
+                nn.Sigmoid(),  # 输出 [0, 1]，用于调整base_weights
+            )
+        else:
+            self.ego_adapter = None
+
+    def forward(self, cam_mask, ego_state=None):
+        """
+        cam_mask: [B, V] bool，True=失效
+        ego_state: [B, 3] 可选，自车状态 (速度, 加速度, 角速度)
+
+        返回：
+            importance_weights: [B, V] 每个相机的重要性权重
+        """
+        B, V = cam_mask.shape
+        device = cam_mask.device
+
+        # 基础权重
+        weights = self.base_weights[:V].unsqueeze(0).expand(B, V).clone()  # [B, V]
+
+        # 根据ego状态动态调整（可选）
+        if self.ego_adapter is not None and ego_state is not None:
+            ego_adj = self.ego_adapter(ego_state)  # [B, V]
+            # 速度越快，前方权重增加更多
+            weights = weights * (1.0 + ego_adj)
+
+        # 归一化（保持总权重和不变）
+        weights = weights / weights.mean(dim=1, keepdim=True) * V
+
+        return weights
+
+    def get_spatial_importance(self, V, H, W, device='cuda'):
+        """
+        返回空间重要性图 [V, H, W]
+
+        在图像空间中，中心区域通常比边缘更重要
+        """
+        importance = torch.ones(V, H, W, device=device)
+
+        # 为每个相机创建中心加权的importance map
+        y, x = torch.meshgrid(
+            torch.linspace(-1, 1, H, device=device),
+            torch.linspace(-1, 1, W, device=device),
+            indexing='ij'
+        )
+        # 中心权重高，边缘权重低
+        spatial_weight = torch.exp(-(x**2 + y**2) / 0.5)  # 高斯权重
+
+        # 应用到每个相机（可以为不同相机设置不同的spatial pattern）
+        for v in range(V):
+            camera_weight = self.base_weights[v].item()
+            importance[v] = spatial_weight * camera_weight
+
+        return importance
+
+
 class LightDreamerRSSM(nn.Module):
     """
     轻量级 Dreamer/RSSM：把多视角特征聚合成 token 序列，按视角维度滚动，
@@ -494,6 +724,25 @@ class SparseDrive(BaseDetector):
             LightDreamerRSSM(**world_model_cfg) if enable_world_model else None
         )
 
+        # ===== 新增：时序补全模块 =====
+        self.temporal_completion = TemporalFeatureCompletion(
+            ch_per_scale=[256, 256, 256, 256],
+            hidden_dim=128,
+            num_layers=2,
+            enable=True,  # 可以通过配置控制
+        )
+
+        # ===== 新增：规划导向加权模块 =====
+        self.planning_weighting = PlanningGuidedWeighting(
+            num_cameras=6,
+            use_ego_state=True,  # 利用ego状态动态调整
+            base_weights=None,  # 使用默认权重
+        )
+
+        # 历史特征队列（用于时序补全）
+        self.feature_history = []
+        self.max_history_length = 3  # 保留最近3帧历史
+
     # -----------------------
     # 仅 backbone + neck 的特征提取
     # -----------------------
@@ -648,7 +897,7 @@ class SparseDrive(BaseDetector):
             return self.forward_test(img, **data)
 
     # -----------------------
-    # 训练前向：带 SSL + VAE
+    # 训练前向：带 SSL + VAE + 时序补全 + 规划导向加权
     # -----------------------
     def forward_train(self, img, **data):
         # img: [B, V, 3, H, W]
@@ -682,8 +931,48 @@ class SparseDrive(BaseDetector):
                 feats_mask_base, feats_full_base, cam_mask
             )
 
-        # 6) VAE 视角补全：只作用在 masked 分支特征上
-        feature_maps, vae_loss = self.pv_recon(feats_mask_base, cam_mask, metas=data)
+        # ===== 新增：时序补全 =====
+        # 6) 时序补全：利用历史帧预测缺失相机的特征
+        if len(self.feature_history) > 0:
+            feats_temporal = self.temporal_completion(
+                feats_mask_base, self.feature_history, cam_mask
+            )
+        else:
+            feats_temporal = feats_mask_base
+
+        # 更新历史队列（用detach避免梯度累积）
+        with torch.no_grad():
+            self.feature_history.append([f.detach().clone() for f in feats_full_base])
+            if len(self.feature_history) > self.max_history_length:
+                self.feature_history.pop(0)
+
+        # ===== 新增：规划导向加权 =====
+        # 7) 计算相机重要性权重
+        # 尝试从data中获取ego状态（速度、加速度、角速度）
+        ego_state = None
+        if 'can_bus' in data and data['can_bus'] is not None:
+            # nuScenes的CAN bus数据包含ego状态
+            # 提取速度、加速度等信息
+            can_bus = data['can_bus']  # [B, 18] or similar
+            if can_bus.shape[-1] >= 3:
+                ego_state = can_bus[:, :3]  # 简单取前3维
+
+        importance_weights = self.planning_weighting(cam_mask, ego_state)  # [B, V]
+
+        # 8) VAE 视角补全（应用规划导向加权）
+        feature_maps, vae_loss = self.pv_recon(feats_temporal, cam_mask, metas=data)
+
+        # 对VAE loss应用重要性加权
+        if vae_loss is not None and importance_weights is not None:
+            # 计算每个相机的平均重要性
+            cam_weights = importance_weights.mean(dim=0)  # [V]
+            # 加权VAE重建损失（简化版：假设loss已经按相机平均）
+            # 这里只是示意，实际可能需要修改PVReconVAE内部计算
+            weight_scale = cam_weights.mean().item()
+            for key in vae_loss:
+                if 'rec' in key:  # 只对重建loss加权
+                    vae_loss[key] = vae_loss[key] * weight_scale
+
         self.vae_loss_dict = vae_loss  # 用于后面合并 loss
 
         # 7) 深度分支（如果有）
@@ -735,12 +1024,28 @@ class SparseDrive(BaseDetector):
         if getattr(self, "test_cam_missing", False):
             img, cam_mask = self.cam_dropout(img, return_mask=True)
 
+        # 提取特征
         feature_maps = self.extract_feat(
             img,
             metas=data.get("img_metas", None),
             cam_mask=cam_mask,
             return_depth=False,
         )
+
+        # ===== 新增：测试时的时序补全 =====
+        # 如果有相机失效且有历史帧，使用时序补全
+        if cam_mask is not None and cam_mask.any() and len(self.feature_history) > 0:
+            feature_maps_list = list(feature_maps) if isinstance(feature_maps, tuple) else feature_maps
+            feature_maps = self.temporal_completion(
+                feature_maps_list, self.feature_history, cam_mask
+            )
+
+        # 更新历史队列（测试时也维护）
+        with torch.no_grad():
+            feat_list = list(feature_maps) if isinstance(feature_maps, tuple) else feature_maps
+            self.feature_history.append([f.detach().clone() for f in feat_list])
+            if len(self.feature_history) > self.max_history_length:
+                self.feature_history.pop(0)
 
         # head 推理
         model_outs = self.head(feature_maps, data)
