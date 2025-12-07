@@ -836,8 +836,9 @@ class SparseDrive(BaseDetector):
                 focal = metas.get("focal", None)
             depths = self.depth_branch(feats, focal)
 
-        if self.use_deformable_func:
-            feats = feature_maps_format(feats)
+        # 注意：不在这里进行 feature_maps_format，
+        # 因为 simple_test 中需要在格式化之前进行时序补全
+        # feature_maps_format 将在 simple_test 中调用
 
         if return_depth:
             return feats, depths
@@ -1047,6 +1048,10 @@ class SparseDrive(BaseDetector):
             self.feature_history.append([f.detach().clone() for f in feat_list])
             if len(self.feature_history) > self.max_history_length:
                 self.feature_history.pop(0)
+
+        # 在时序补全之后，进行特征格式化（如果需要）
+        if self.use_deformable_func:
+            feature_maps = feature_maps_format(feature_maps)
 
         # head 推理
         model_outs = self.head(feature_maps, data)
