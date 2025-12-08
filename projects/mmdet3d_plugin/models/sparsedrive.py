@@ -326,7 +326,18 @@ class TemporalFeatureCompletion(nn.Module):
 
                 # 提取历史序列 [T, B, C, H, W]
                 hist_seq = [h[:, v] for h in history_feats]  # List of [B, C, H, W]
-                hist_seq = torch.stack(hist_seq, dim=0)  # [T, B, C, H, W]
+
+                # 过滤掉batch size不匹配的历史帧
+                hist_seq_filtered = []
+                for h in hist_seq:
+                    if h.shape[0] == B:  # 只保留batch size匹配的
+                        hist_seq_filtered.append(h)
+
+                if len(hist_seq_filtered) == 0:
+                    # 没有匹配的历史帧，跳过这个相机
+                    continue
+
+                hist_seq = torch.stack(hist_seq_filtered, dim=0)  # [T, B, C, H, W]
                 T = hist_seq.shape[0]
 
                 # 全局平均池化：[T, B, C, H, W] -> [T, B, C]
