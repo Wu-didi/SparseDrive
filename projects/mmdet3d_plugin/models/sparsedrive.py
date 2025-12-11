@@ -709,15 +709,15 @@ class SparseDrive(BaseDetector):
         self.pv_recon = PVReconVAE(
             ch_per_scale=[256, 256, 256, 256],
             latent_channels=64,
-            lambda_rec=1.0,
+            lambda_rec=0.01,  # 降低权重：从1.0改为0.01，避免VAE损失主导训练
             lambda_kl=1e-4,
         )
 
         # 存储 VAE loss
         self.vae_loss_dict = None
 
-        # 自监督损失权重
-        self.ssl_weight = ssl_weight
+        # 自监督损失权重（降低权重：从默认1.0改为0.01）
+        self.ssl_weight = ssl_weight if ssl_weight != 1.0 else 0.01
 
         # 轻量 Dreamer 世界模型
         enable_world_model = True
@@ -727,7 +727,7 @@ class SparseDrive(BaseDetector):
                 deter_dim=128,
                 stoch_dim=32,
                 hidden_dim=128,
-                lambda_rec=1.0,
+                lambda_rec=0.01,  # 降低权重：从1.0改为0.01，避免世界模型损失主导训练
                 lambda_kl=1e-4,
             )
         else:
