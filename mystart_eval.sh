@@ -3,7 +3,7 @@ cd /mnt/home/wudi/code_v3/SparseDrive
 
 # 评估配置
 CONFIG="projects/configs/sparsedrive_small_stage2.py"
-CHECKPOINT="work_dirs/sparsedrive_small_stage2/iter_70320.pth"  # 修改为你的checkpoint路径
+CHECKPOINT="work_dirs/sparsedrive_small_stage2_exp12/iter_70320.pth"  # 修改为你的checkpoint路径
 GPUS=1
 
 # 单GPU评估
