@@ -25,6 +25,7 @@ except Exception:
 __all__ = ["SparseDrive"]
 
 from einops import rearrange  # 目前未用到，保留
+from .temporal_completion import MotionCompensatedTemporalCompletion
 
 
 # ================================
@@ -1213,12 +1214,16 @@ class SparseDrive(BaseDetector):
             LightDreamerRSSM(**world_model_cfg) if enable_world_model else None
         )
 
-        # ===== 新增：时序补全模块 =====
-        self.temporal_completion = TemporalFeatureCompletion(
+        # ===== 新增：时序补全模块（运动补偿版本）=====
+        self.temporal_completion = MotionCompensatedTemporalCompletion(
             ch_per_scale=[256, 256, 256, 256],
-            hidden_dim=128,
-            num_layers=2,
-            enable=True,  # 可以通过配置控制
+            embed_dims=256,
+            num_heads=8,
+            queue_length=3,
+            num_cameras=6,
+            reference_depths=[5, 10, 20, 40],
+            use_flash_attn=False,  # 设为 False 以兼容更多环境
+            enable=True,
         )
 
         # ===== 新增：规划导向加权模块 =====
@@ -1437,16 +1442,14 @@ class SparseDrive(BaseDetector):
                 feats_mask_base, feats_full_base, cam_mask
             )
 
-        # ===== 新增：时序补全 =====
+        # ===== 新增：时序补全（运动补偿版本）=====
         # 6) 时序补全：利用历史帧预测缺失相机的特征
-        if len(self.feature_history) > 0:
-            feats_temporal = self.temporal_completion(
-                feats_mask_base, self.feature_history, cam_mask
-            )
-        else:
-            feats_temporal = feats_mask_base
+        # 新版本模块内置特征队列，自动管理历史帧
+        feats_temporal = self.temporal_completion(
+            feats_mask_base, cam_mask, metas=data
+        )
 
-        # 更新历史队列（用detach避免梯度累积）
+        # 保留旧的历史队列更新（用于其他模块，如 VAE）
         with torch.no_grad():
             self.feature_history.append([f.detach().clone() for f in feats_full_base])
             if len(self.feature_history) > self.max_history_length:
