@@ -1214,16 +1214,15 @@ class SparseDrive(BaseDetector):
             LightDreamerRSSM(**world_model_cfg) if enable_world_model else None
         )
 
-        # ===== 新增：时序补全模块（运动补偿版本，显存优化）=====
+        # ===== 新增：时序补全模块（运动补偿版本）=====
         self.temporal_completion = MotionCompensatedTemporalCompletion(
             ch_per_scale=[256, 256, 256, 256],
             embed_dims=256,
             num_heads=8,
-            queue_length=2,       # 减少到2帧
+            queue_length=3,
             num_cameras=6,
-            reference_depths=[10, 30],  # 减少深度假设
-            kv_downsample=4,      # Key/Value 4x下采样
-            use_flash_attn=False,
+            reference_depths=[5, 10, 20, 40],
+            use_checkpoint=True,  # 使用 gradient checkpointing 减少显存
             enable=True,
         )
 
