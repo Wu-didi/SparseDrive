@@ -13,14 +13,14 @@ __all__ = ['MotionCompensatedTemporalCompletion']
 
 class FeatureQueue:
     """
-    历史帧特征队列
+    历史帧特征队列（显存优化版）
 
-    维护多帧历史特征和对应的元数据（用于计算 T_temp2cur）
+    只存储单一尺度的特征，减少显存占用
     """
-    def __init__(self, queue_length: int = 3, max_time_interval: float = 2.0):
+    def __init__(self, queue_length: int = 2, max_time_interval: float = 2.0):
         """
         Args:
-            queue_length: 队列长度（保存多少帧历史）
+            queue_length: 队列长度（保存多少帧历史），默认2帧节省显存
             max_time_interval: 最大时间间隔（秒），超过则认为历史无效
         """
         self.queue_length = queue_length
@@ -29,16 +29,16 @@ class FeatureQueue:
 
     def reset(self):
         """重置队列"""
-        self.feature_queue: List[List[torch.Tensor]] = []  # List[List[Tensor]]
-        self.T_global_queue: List[np.ndarray] = []  # 历史帧的 T_global
-        self.timestamp_queue: List[float] = []  # 时间戳
+        self.feature_queue: List[torch.Tensor] = []  # 只存储单一尺度
+        self.T_global_queue: List[np.ndarray] = []
+        self.timestamp_queue: List[float] = []
 
-    def push(self, feats: List[torch.Tensor], metas: Dict):
+    def push(self, feat: torch.Tensor, metas: Dict):
         """
-        添加新帧到队列
+        添加新帧到队列（只存储单一尺度特征）
 
         Args:
-            feats: List[Tensor]，多尺度特征
+            feat: Tensor [B, V, C, H, W]，单一尺度特征
             metas: 包含 'img_metas' 的字典
         """
         # 获取 T_global
@@ -56,8 +56,8 @@ class FeatureQueue:
         if isinstance(timestamp, torch.Tensor):
             timestamp = timestamp.item() if timestamp.numel() == 1 else timestamp[0].item()
 
-        # 添加到队列
-        self.feature_queue.append([f.detach().clone() for f in feats])
+        # 添加到队列（detach 避免梯度累积）
+        self.feature_queue.append(feat.detach())
         self.T_global_queue.append(T_global.copy() if isinstance(T_global, np.ndarray) else T_global)
         self.timestamp_queue.append(timestamp)
 
@@ -67,15 +67,8 @@ class FeatureQueue:
             self.T_global_queue.pop(0)
             self.timestamp_queue.pop(0)
 
-    def get(self) -> Tuple[List[List[torch.Tensor]], List[np.ndarray], List[float]]:
-        """
-        获取历史特征和元数据
-
-        Returns:
-            feature_queue: 历史特征队列
-            T_global_queue: 历史帧的 T_global
-            timestamp_queue: 时间戳队列
-        """
+    def get(self) -> Tuple[List[torch.Tensor], List[np.ndarray], List[float]]:
+        """获取历史特征和元数据"""
         return self.feature_queue, self.T_global_queue, self.timestamp_queue
 
     def __len__(self):
@@ -272,12 +265,12 @@ class ImageLevelMotionWarp(nn.Module):
 
 class TemporalCrossAttention(nn.Module):
     """
-    时序跨相机注意力
+    时序跨相机注意力（显存优化版）
 
     特点：
     1. 支持跨相机历史融合（失效相机可从所有相机历史获取信息）
-    2. 包含空间、时间、相机位置编码
-    3. 保持空间结构输出
+    2. 对 Key/Value 做空间下采样，大幅减少显存
+    3. 包含空间、时间、相机位置编码
     """
     def __init__(self,
                  embed_dims: int = 256,
@@ -285,6 +278,7 @@ class TemporalCrossAttention(nn.Module):
                  num_cameras: int = 6,
                  num_history: int = 3,
                  dropout: float = 0.1,
+                 kv_downsample: int = 4,  # Key/Value 空间下采样倍数
                  use_flash_attn: bool = True):
         """
         Args:
@@ -293,6 +287,7 @@ class TemporalCrossAttention(nn.Module):
             num_cameras: 相机数量
             num_history: 历史帧数量
             dropout: Dropout 比例
+            kv_downsample: Key/Value 的空间下采样倍数（减少显存）
             use_flash_attn: 是否使用 FlashAttention（需要安装）
         """
         super().__init__()
@@ -301,6 +296,7 @@ class TemporalCrossAttention(nn.Module):
         self.num_cameras = num_cameras
         self.num_history = num_history
         self.use_flash_attn = use_flash_attn
+        self.kv_downsample = kv_downsample
 
         # 可学习的 Query 初始化
         self.query_embed = nn.Parameter(torch.randn(1, embed_dims, 1, 1) * 0.02)
@@ -313,8 +309,11 @@ class TemporalCrossAttention(nn.Module):
         self.spatial_pos_embed = nn.Parameter(torch.randn(1, embed_dims, 1, 1) * 0.02)
 
         # 相机距离编码（用于跨相机注意力）
-        # 相邻相机应该有更高的注意力权重
         self.register_buffer('camera_adjacency', self._create_camera_adjacency())
+
+        # Key/Value 空间下采样
+        if kv_downsample > 1:
+            self.kv_pool = nn.AdaptiveAvgPool2d(None)  # 动态设置
 
         # 注意力层
         self.q_proj = nn.Linear(embed_dims, embed_dims)
@@ -336,24 +335,14 @@ class TemporalCrossAttention(nn.Module):
         0: FRONT, 1: FRONT_LEFT, 2: FRONT_RIGHT,
         3: BACK_LEFT, 4: BACK_RIGHT, 5: BACK
         """
-        # 相邻相机权重更高
         adjacency = torch.ones(6, 6) * 0.5
         adjacency.fill_diagonal_(1.0)
-
-        # 前视与前侧相机相邻
-        adjacency[0, 1] = adjacency[1, 0] = 0.8  # FRONT - FRONT_LEFT
-        adjacency[0, 2] = adjacency[2, 0] = 0.8  # FRONT - FRONT_RIGHT
-
-        # 后视与后侧相机相邻
-        adjacency[5, 3] = adjacency[3, 5] = 0.8  # BACK - BACK_LEFT
-        adjacency[5, 4] = adjacency[4, 5] = 0.8  # BACK - BACK_RIGHT
-
-        # 左侧相机链
-        adjacency[1, 3] = adjacency[3, 1] = 0.7  # FRONT_LEFT - BACK_LEFT
-
-        # 右侧相机链
-        adjacency[2, 4] = adjacency[4, 2] = 0.7  # FRONT_RIGHT - BACK_RIGHT
-
+        adjacency[0, 1] = adjacency[1, 0] = 0.8
+        adjacency[0, 2] = adjacency[2, 0] = 0.8
+        adjacency[5, 3] = adjacency[3, 5] = 0.8
+        adjacency[5, 4] = adjacency[4, 5] = 0.8
+        adjacency[1, 3] = adjacency[3, 1] = 0.7
+        adjacency[2, 4] = adjacency[4, 2] = 0.7
         return adjacency
 
     def forward(self,
@@ -361,7 +350,7 @@ class TemporalCrossAttention(nn.Module):
                 history_feats: torch.Tensor,
                 H: int, W: int) -> torch.Tensor:
         """
-        对单个失效相机进行补全
+        对单个失效相机进行补全（显存优化版）
 
         Args:
             query_cam_idx: 失效相机索引
@@ -375,61 +364,56 @@ class TemporalCrossAttention(nn.Module):
         device = history_feats.device
 
         # 1. 构建 Query（可学习初始化）
-        query = self.query_embed.expand(B, -1, H, W)  # [B, C, H, W]
+        query = self.query_embed.expand(B, -1, H, W)
         query = query + self.camera_pos_embed[query_cam_idx].view(1, -1, 1, 1)
         query = query + self.spatial_pos_embed.expand(B, -1, H, W)
-
-        # 展平空间维度
         query_flat = query.flatten(2).permute(0, 2, 1)  # [B, H*W, C]
 
-        # 2. 构建 Key/Value（所有相机的历史特征）
-        # 添加位置编码
-        kv = history_feats.clone()  # [B, V, T, C, H, W]
+        # 2. 构建 Key/Value（对历史特征做空间下采样以节省显存）
+        # 下采样尺寸
+        H_kv = max(H_in // self.kv_downsample, 1)
+        W_kv = max(W_in // self.kv_downsample, 1)
 
-        # 时间位置编码
+        # 重塑并下采样
+        kv = history_feats.view(B * V * T, C, H_in, W_in)
+        if self.kv_downsample > 1:
+            kv = F.adaptive_avg_pool2d(kv, (H_kv, W_kv))  # [B*V*T, C, H_kv, W_kv]
+        kv = kv.view(B, V, T, C, H_kv, W_kv)
+
+        # 添加位置编码（在下采样后添加，节省计算）
         for t in range(T):
             kv[:, :, t] = kv[:, :, t] + self.temporal_pos_embed[t].view(1, 1, -1, 1, 1)
-
-        # 相机位置编码
         for v in range(V):
             kv[:, v] = kv[:, v] + self.camera_pos_embed[v].view(1, 1, -1, 1, 1)
 
         # 展平
-        kv_flat = kv.permute(0, 1, 2, 4, 5, 3)  # [B, V, T, H, W, C]
-        kv_flat = kv_flat.reshape(B, V * T * H_in * W_in, C)  # [B, V*T*H*W, C]
+        kv_flat = kv.permute(0, 1, 2, 4, 5, 3).reshape(B, V * T * H_kv * W_kv, C)
 
         # 3. 投影
         q = self.q_proj(query_flat)  # [B, H*W, C]
-        k = self.k_proj(kv_flat)      # [B, V*T*H*W, C]
-        v = self.v_proj(kv_flat)      # [B, V*T*H*W, C]
+        k = self.k_proj(kv_flat)      # [B, V*T*H_kv*W_kv, C]
+        v_out = self.v_proj(kv_flat)
 
         # 4. 计算注意力
-        # 使用相机邻接性调整注意力
         scale = (C // self.num_heads) ** -0.5
 
         # 重塑为多头
         q = q.view(B, H * W, self.num_heads, C // self.num_heads).transpose(1, 2)
-        k = k.view(B, V * T * H_in * W_in, self.num_heads, C // self.num_heads).transpose(1, 2)
-        v = v.view(B, V * T * H_in * W_in, self.num_heads, C // self.num_heads).transpose(1, 2)
+        k = k.view(B, -1, self.num_heads, C // self.num_heads).transpose(1, 2)
+        v_out = v_out.view(B, -1, self.num_heads, C // self.num_heads).transpose(1, 2)
 
         # 注意力分数
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, heads, H*W, V*T*H*W]
-
-        # 应用相机邻接性偏置（可选，用于强调相邻相机）
-        # 这里简化处理，不添加额外偏置
-
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
         attn = F.softmax(attn, dim=-1)
         attn = self.dropout(attn)
 
         # 加权求和
-        out = torch.matmul(attn, v)  # [B, heads, H*W, C//heads]
-        out = out.transpose(1, 2).reshape(B, H * W, C)  # [B, H*W, C]
+        out = torch.matmul(attn, v_out)
+        out = out.transpose(1, 2).reshape(B, H * W, C)
 
         # 输出投影
         out = self.out_proj(out)
         out = self.norm(out)
-
-        # 重塑为空间形式
         out = out.permute(0, 2, 1).reshape(B, C, H, W)
 
         return out
@@ -487,13 +471,13 @@ class ResBlock(nn.Module):
 
 class MotionCompensatedTemporalCompletion(nn.Module):
     """
-    运动补偿时序补全模块
+    运动补偿时序补全模块（显存优化版）
 
-    核心创新：
-    1. 运动补偿：使用 T_temp2cur 对历史特征进行 warp，对齐到当前帧
-    2. 可学习偏移：在基础 warp 上加可学习残差，处理深度不确定性
-    3. 跨相机融合：失效相机可从所有相机的历史帧获取信息
-    4. 保留空间结构：不使用全局池化，保持 [H, W] 维度
+    显存优化策略：
+    1. 只存储和处理最粗尺度特征（scale_idx=-1）
+    2. 历史队列长度减少到 2 帧
+    3. Key/Value 做 4x 空间下采样
+    4. 补全结果上采样后应用到所有尺度
 
     输入：
         current_feats: List[Tensor] 当前帧多尺度特征，每个 [B, V, C, H, W]
@@ -507,22 +491,12 @@ class MotionCompensatedTemporalCompletion(nn.Module):
                  ch_per_scale: List[int],
                  embed_dims: int = 256,
                  num_heads: int = 8,
-                 queue_length: int = 3,
+                 queue_length: int = 2,  # 减少到 2 帧
                  num_cameras: int = 6,
-                 reference_depths: List[float] = [5, 10, 20, 40],
-                 use_flash_attn: bool = True,
+                 reference_depths: List[float] = [10, 30],  # 减少深度假设
+                 kv_downsample: int = 4,  # Key/Value 下采样
+                 use_flash_attn: bool = False,
                  enable: bool = True):
-        """
-        Args:
-            ch_per_scale: 每个尺度的通道数
-            embed_dims: 注意力维度
-            num_heads: 注意力头数
-            queue_length: 历史帧队列长度
-            num_cameras: 相机数量
-            reference_depths: 参考深度列表
-            use_flash_attn: 是否使用 FlashAttention
-            enable: 是否启用
-        """
         super().__init__()
         self.enable = enable
         self.num_scales = len(ch_per_scale)
@@ -532,18 +506,19 @@ class MotionCompensatedTemporalCompletion(nn.Module):
         if not enable:
             return
 
-        # 特征队列
+        # 只处理最粗尺度（最后一个尺度，显存最小）
+        self.process_scale_idx = -1
+        process_ch = ch_per_scale[self.process_scale_idx]
+
+        # 特征队列（只存储单一尺度）
         self.feature_queue = FeatureQueue(queue_length=queue_length)
 
-        # 每个尺度的运动 warp 模块
-        self.motion_warps = nn.ModuleList([
-            ImageLevelMotionWarp(
-                embed_dims=c,
-                reference_depths=reference_depths,
-                learnable_offset=True,
-            )
-            for c in ch_per_scale
-        ])
+        # 单一尺度的运动 warp 模块
+        self.motion_warp = ImageLevelMotionWarp(
+            embed_dims=process_ch,
+            reference_depths=reference_depths,
+            learnable_offset=True,
+        )
 
         # 时序跨相机注意力
         self.temporal_attention = TemporalCrossAttention(
@@ -551,46 +526,38 @@ class MotionCompensatedTemporalCompletion(nn.Module):
             num_heads=num_heads,
             num_cameras=num_cameras,
             num_history=queue_length,
+            kv_downsample=kv_downsample,
             use_flash_attn=use_flash_attn,
         )
 
-        # 每个尺度的特征适配层（将不同通道数适配到 embed_dims）
-        self.feat_adapters = nn.ModuleList([
-            nn.Conv2d(c, embed_dims, 1) if c != embed_dims else nn.Identity()
-            for c in ch_per_scale
-        ])
+        # 特征适配层
+        self.feat_adapter = nn.Conv2d(process_ch, embed_dims, 1) if process_ch != embed_dims else nn.Identity()
+        self.out_adapter = nn.Conv2d(embed_dims, process_ch, 1) if process_ch != embed_dims else nn.Identity()
 
-        # 每个尺度的输出适配层
-        self.out_adapters = nn.ModuleList([
-            nn.Conv2d(embed_dims, c, 1) if c != embed_dims else nn.Identity()
-            for c in ch_per_scale
-        ])
-
-        # 空间解码器
-        self.spatial_decoder = SpatialDecoder(embed_dims=embed_dims)
-
-        # 门控融合（决定使用多少补全特征）
-        self.gate = nn.Sequential(
-            nn.Conv2d(embed_dims * 2, embed_dims // 2, 3, padding=1),
+        # 空间解码器（轻量版）
+        self.spatial_decoder = nn.Sequential(
+            nn.Conv2d(embed_dims, embed_dims, 3, padding=1, bias=False),
+            nn.BatchNorm2d(embed_dims),
             nn.ReLU(inplace=True),
-            nn.Conv2d(embed_dims // 2, 1, 1),
+            nn.Conv2d(embed_dims, embed_dims, 1),
+        )
+        nn.init.normal_(self.spatial_decoder[-1].weight, mean=0, std=0.01)
+        nn.init.zeros_(self.spatial_decoder[-1].bias)
+
+        # 门控融合
+        self.gate = nn.Sequential(
+            nn.Conv2d(process_ch * 2, process_ch // 4, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(process_ch // 4, 1, 1),
             nn.Sigmoid()
         )
-        # 初始化门控偏置为负值，初期少用补全特征
         nn.init.constant_(self.gate[-2].bias, -2.0)
 
-        # 默认图像尺寸（会在 forward 中更新）
-        self.img_shape = (900, 1600)  # nuScenes 默认
+        # 默认图像尺寸
+        self.img_shape = (900, 1600)
 
-    def compute_T_temp2cur(self,
-                           T_global_hist: np.ndarray,
-                           T_global_cur: np.ndarray,
-                           device: torch.device) -> torch.Tensor:
-        """
-        计算历史帧到当前帧的变换矩阵
-
-        T_temp2cur = T_global_inv_cur @ T_global_hist
-        """
+    def compute_T_temp2cur(self, T_global_hist: np.ndarray, T_global_cur: np.ndarray, device) -> torch.Tensor:
+        """计算历史帧到当前帧的变换矩阵"""
         T_global_inv_cur = np.linalg.inv(T_global_cur)
         T_temp2cur = T_global_inv_cur @ T_global_hist
         return torch.tensor(T_temp2cur, dtype=torch.float32, device=device)
@@ -600,41 +567,37 @@ class MotionCompensatedTemporalCompletion(nn.Module):
                 cam_mask: torch.Tensor,
                 metas: Dict) -> List[torch.Tensor]:
         """
-        前向传播
+        前向传播（显存优化版）
 
-        Args:
-            current_feats: List[Tensor]，每个 [B, V, C, H, W]
-            cam_mask: [B, V] bool，True 表示该相机失效
-            metas: dict，包含 'img_metas' 等
-
-        Returns:
-            completed_feats: List[Tensor]，补全后的特征
+        只处理最粗尺度，补全结果应用到所有尺度
         """
         if not self.enable:
             return current_feats
 
+        # 获取要处理的尺度特征
+        feat_process = current_feats[self.process_scale_idx]  # [B, V, C, H, W]
+        B, V, C, H, W = feat_process.shape
+        device = feat_process.device
+
         if cam_mask is None or not cam_mask.any():
             # 没有失效相机，更新队列后直接返回
             with torch.no_grad():
-                self.feature_queue.push(current_feats, metas)
+                self.feature_queue.push(feat_process, metas)
             return current_feats
 
-        B, V = cam_mask.shape
-        device = cam_mask.device
-
         # 获取历史特征
-        history_feats, T_global_queue, timestamp_queue = self.feature_queue.get()
+        history_feats, T_global_queue, _ = self.feature_queue.get()
 
         if len(history_feats) == 0:
             # 没有历史帧，更新队列后返回原始特征
             with torch.no_grad():
-                self.feature_queue.push(current_feats, metas)
+                self.feature_queue.push(feat_process, metas)
             return current_feats
 
-        # 获取当前帧的 T_global 和 lidar2img
+        # 获取当前帧的变换矩阵
         T_global_cur = metas['img_metas'][0].get('T_global', np.eye(4))
 
-        # lidar2img: [B, V, 4, 4]
+        # 获取 lidar2img
         if 'lidar2img' in metas['img_metas'][0]:
             lidar2img = metas['img_metas'][0]['lidar2img']
             if isinstance(lidar2img, np.ndarray):
@@ -642,108 +605,83 @@ class MotionCompensatedTemporalCompletion(nn.Module):
             elif isinstance(lidar2img, list):
                 lidar2img = torch.tensor(np.stack(lidar2img), dtype=torch.float32, device=device)
         else:
-            # 使用单位矩阵作为默认值
             lidar2img = torch.eye(4, device=device).unsqueeze(0).expand(V, -1, -1)
 
-        # 确保 lidar2img 形状正确
-        if lidar2img.dim() == 3:  # [V, 4, 4]
-            lidar2img = lidar2img.unsqueeze(0).expand(B, -1, -1, -1)  # [B, V, 4, 4]
+        if lidar2img.dim() == 3:
+            lidar2img = lidar2img.unsqueeze(0).expand(B, -1, -1, -1)
 
-        # 计算每个历史帧的 T_temp2cur
-        T_temp2cur_list = []
-        for T_global_hist in T_global_queue:
-            T_temp2cur = self.compute_T_temp2cur(T_global_hist, T_global_cur, device)
-            T_temp2cur = T_temp2cur.unsqueeze(0).expand(B, -1, -1)  # [B, 4, 4]
-            T_temp2cur_list.append(T_temp2cur)
-
-        # 对每个尺度进行补全
-        outputs = []
-
-        for scale_idx, feat_cur in enumerate(current_feats):
-            B, V, C, H, W = feat_cur.shape
-            feat_out = feat_cur.clone()
-
-            # 收集该尺度的历史特征并进行运动补偿
-            warped_history = []  # List[[B, V, C, H, W]]
-
-            for t, T_temp2cur in enumerate(T_temp2cur_list):
-                if t >= len(history_feats):
-                    continue
-
-                hist_feat = history_feats[t][scale_idx]  # [B, V, C, H, W]
-
-                # 检查 batch size 是否匹配
-                if hist_feat.shape[0] != B:
-                    continue
-
-                # 对每个相机进行 warp
-                warped_cams = []
-                for v in range(V):
-                    warped = self.motion_warps[scale_idx](
-                        hist_feat[:, v],  # [B, C, H, W]
-                        T_temp2cur,       # [B, 4, 4]
-                        lidar2img[:, v],  # [B, 4, 4]
-                        self.img_shape,
-                    )
-                    warped_cams.append(warped)
-
-                warped_hist = torch.stack(warped_cams, dim=1)  # [B, V, C, H, W]
-                warped_history.append(warped_hist)
-
-            if len(warped_history) == 0:
-                outputs.append(feat_out)
+        # 计算 T_temp2cur 并 warp 历史特征
+        warped_history = []
+        for t, (hist_feat, T_global_hist) in enumerate(zip(history_feats, T_global_queue)):
+            if hist_feat.shape[0] != B:
                 continue
 
-            # 堆叠历史帧 [B, V, T, C, H, W]
-            warped_history = torch.stack(warped_history, dim=2)
-            T_actual = warped_history.shape[2]
+            T_temp2cur = self.compute_T_temp2cur(T_global_hist, T_global_cur, device)
+            T_temp2cur = T_temp2cur.unsqueeze(0).expand(B, -1, -1)
 
-            # 适配到 embed_dims
-            warped_history_adapted = self.feat_adapters[scale_idx](
-                warped_history.reshape(B * V * T_actual, C, H, W)
-            )
-            embed_dims = warped_history_adapted.shape[1]
-            warped_history_adapted = warped_history_adapted.reshape(B, V, T_actual, embed_dims, H, W)
-
-            # 对每个失效相机进行补全
+            # 对每个相机 warp
+            warped_cams = []
             for v in range(V):
-                missing_mask = cam_mask[:, v]  # [B]
-                if not missing_mask.any():
-                    continue
+                warped = self.motion_warp(hist_feat[:, v], T_temp2cur, lidar2img[:, v], self.img_shape)
+                warped_cams.append(warped)
+            warped_hist = torch.stack(warped_cams, dim=1)
+            warped_history.append(warped_hist)
 
-                # 时序跨相机注意力
-                completed = self.temporal_attention(
-                    query_cam_idx=v,
-                    history_feats=warped_history_adapted,
-                    H=H, W=W,
-                )  # [B, embed_dims, H, W]
+        if len(warped_history) == 0:
+            with torch.no_grad():
+                self.feature_queue.push(feat_process, metas)
+            return current_feats
 
-                # 空间解码
-                completed = self.spatial_decoder(completed)
+        # 堆叠历史帧 [B, V, T, C, H, W]
+        warped_history = torch.stack(warped_history, dim=2)
+        T_actual = warped_history.shape[2]
 
-                # 门控融合
-                feat_cur_adapted = self.feat_adapters[scale_idx](feat_cur[:, v])
-                gate_input = torch.cat([feat_cur_adapted, completed], dim=1)
-                gate = self.gate(gate_input)
+        # 适配到 embed_dims
+        warped_adapted = self.feat_adapter(warped_history.view(B * V * T_actual, C, H, W))
+        embed_dims = warped_adapted.shape[1]
+        warped_adapted = warped_adapted.view(B, V, T_actual, embed_dims, H, W)
 
-                fused = feat_cur_adapted * (1 - gate) + completed * gate
+        # 对每个失效相机进行补全
+        feat_out = feat_process.clone()
 
-                # 适配回原始通道数
-                fused = self.out_adapters[scale_idx](fused)
+        for v in range(V):
+            missing_mask = cam_mask[:, v]
+            if not missing_mask.any():
+                continue
 
-                # 只替换失效的 batch
-                mask = missing_mask.view(B, 1, 1, 1).float()
-                feat_out[:, v] = feat_out[:, v] * (1 - mask) + fused * mask
+            # 时序注意力
+            completed = self.temporal_attention(
+                query_cam_idx=v,
+                history_feats=warped_adapted,
+                H=H, W=W,
+            )
 
-            outputs.append(feat_out)
+            # 空间解码
+            completed = self.spatial_decoder(completed)
+
+            # 适配回原始通道
+            completed = self.out_adapter(completed)
+
+            # 门控融合
+            gate_input = torch.cat([feat_process[:, v], completed], dim=1)
+            gate = self.gate(gate_input)
+            fused = feat_process[:, v] * (1 - gate) + completed * gate
+
+            # 只替换失效的 batch
+            mask = missing_mask.view(B, 1, 1, 1).float()
+            feat_out[:, v] = feat_out[:, v] * (1 - mask) + fused * mask
 
         # 更新历史队列
         with torch.no_grad():
-            self.feature_queue.push(current_feats, metas)
+            self.feature_queue.push(feat_process, metas)
+
+        # 构建输出：只更新处理的尺度
+        outputs = list(current_feats)
+        outputs[self.process_scale_idx] = feat_out
 
         return outputs
 
     def reset(self):
-        """重置历史队列（新序列开始时调用）"""
+        """重置历史队列"""
         if hasattr(self, 'feature_queue'):
             self.feature_queue.reset()
