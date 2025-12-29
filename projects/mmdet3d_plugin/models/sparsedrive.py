@@ -1144,6 +1144,7 @@ class SparseDrive(BaseDetector):
         ssl_weight=1.0,        # 自监督损失权重
         world_model_cfg=None,  # Dreamer 风格潜世界模型
         test_cam_missing=False,  # 测试时是否模拟相机缺失
+        temporal_completion_cfg=None,  # 时序补全配置
     ):
         super(SparseDrive, self).__init__(init_cfg=init_cfg)
 
@@ -1214,16 +1215,20 @@ class SparseDrive(BaseDetector):
             LightDreamerRSSM(**world_model_cfg) if enable_world_model else None
         )
 
-        # ===== 新增：时序补全模块（运动补偿版本）=====
+        # ===== 新增：时序补全模块（运动补偿版本，显存优化）=====
+        if temporal_completion_cfg is None:
+            temporal_completion_cfg = {}
+        tc_enable = temporal_completion_cfg.get('enable', True)
         self.temporal_completion = MotionCompensatedTemporalCompletion(
-            ch_per_scale=[256, 256, 256, 256],
-            embed_dims=256,
-            num_heads=8,
-            queue_length=3,
-            num_cameras=6,
-            reference_depths=[5, 10, 20, 40],
-            use_checkpoint=True,  # 使用 gradient checkpointing 减少显存
-            enable=True,
+            ch_per_scale=temporal_completion_cfg.get('ch_per_scale', [256, 256, 256, 256]),
+            embed_dims=temporal_completion_cfg.get('embed_dims', 256),
+            num_heads=temporal_completion_cfg.get('num_heads', 8),
+            queue_length=temporal_completion_cfg.get('queue_length', 2),  # 显存优化：2帧
+            num_cameras=temporal_completion_cfg.get('num_cameras', 6),
+            reference_depths=temporal_completion_cfg.get('reference_depths', [10, 30]),  # 显存优化：2个深度
+            kv_downsample=temporal_completion_cfg.get('kv_downsample', 4),  # 显存优化：4x下采样
+            use_flash_attn=temporal_completion_cfg.get('use_flash_attn', False),
+            enable=tc_enable,
         )
 
         # ===== 新增：规划导向加权模块 =====
