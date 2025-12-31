@@ -1609,18 +1609,20 @@ class SparseDrive(BaseDetector):
         # 新版 MotionCompensatedTemporalCompletion 有内部队列，不需要外部 feature_history
         if cam_mask is not None and cam_mask.any():
             feature_maps_list = list(feature_maps) if isinstance(feature_maps, tuple) else feature_maps
-            feature_maps = self.temporal_completion(
-                feature_maps_list, cam_mask, metas=data
-            )
+            with torch.no_grad():
+                feature_maps = self.temporal_completion(
+                    feature_maps_list, cam_mask, metas=data
+                )
 
         # ===== 新增：测试时的规划引导补全（仅跨相机注意力） =====
         # 推理时使用跨相机注意力，不使用轨迹引导（避免两次前向）
         if cam_mask is not None and cam_mask.any():
             feature_maps_list = list(feature_maps) if isinstance(feature_maps, tuple) else feature_maps
-            # 使用规划引导补全，但不传入轨迹（仅利用跨相机注意力）
-            feature_maps_guided, _ = self.planning_guided_completion(
-                feature_maps_list, cam_mask, ego_trajectory=None, cam_params=None
-            )
+            with torch.no_grad():
+                # 使用规划引导补全，但不传入轨迹（仅利用跨相机注意力）
+                feature_maps_guided, _ = self.planning_guided_completion(
+                    feature_maps_list, cam_mask, ego_trajectory=None, cam_params=None
+                )
             if feature_maps_guided is not None:
                 feature_maps = feature_maps_guided
 
