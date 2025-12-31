@@ -1606,11 +1606,11 @@ class SparseDrive(BaseDetector):
         )
 
         # ===== 新增：测试时的时序补全 =====
-        # 如果有相机失效且有历史帧，使用时序补全
-        if cam_mask is not None and cam_mask.any() and len(self.feature_history) > 0:
+        # 新版 MotionCompensatedTemporalCompletion 有内部队列，不需要外部 feature_history
+        if cam_mask is not None and cam_mask.any():
             feature_maps_list = list(feature_maps) if isinstance(feature_maps, tuple) else feature_maps
             feature_maps = self.temporal_completion(
-                feature_maps_list, self.feature_history, cam_mask
+                feature_maps_list, cam_mask, metas=data
             )
 
         # ===== 新增：测试时的规划引导补全（仅跨相机注意力） =====
