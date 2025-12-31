@@ -594,12 +594,19 @@ class MotionCompensatedTemporalCompletion(nn.Module):
                 self.feature_queue.push(feat_process, metas)
             return current_feats
 
-        # 获取当前帧的变换矩阵
-        T_global_cur = metas['img_metas'][0].get('T_global', np.eye(4))
+        # 获取当前帧的变换矩阵（带空值检查）
+        img_metas = metas.get('img_metas', None)
+        if img_metas is None or not isinstance(img_metas, list) or len(img_metas) == 0:
+            # 没有有效的 img_metas，跳过时序补全
+            with torch.no_grad():
+                self.feature_queue.push(feat_process, metas)
+            return current_feats
+
+        T_global_cur = img_metas[0].get('T_global', np.eye(4))
 
         # 获取 lidar2img
-        if 'lidar2img' in metas['img_metas'][0]:
-            lidar2img = metas['img_metas'][0]['lidar2img']
+        if 'lidar2img' in img_metas[0]:
+            lidar2img = img_metas[0]['lidar2img']
             if isinstance(lidar2img, np.ndarray):
                 lidar2img = torch.tensor(lidar2img, dtype=torch.float32, device=device)
             elif isinstance(lidar2img, list):
