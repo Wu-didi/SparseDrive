@@ -9,7 +9,7 @@ dist_params = dict(backend="nccl")
 log_level = "INFO"
 work_dir = None
 
-total_batch_size = 4
+total_batch_size =4
 num_gpus = 1
 batch_size = total_batch_size // num_gpus
 num_iters_per_epoch = int(length[version] // (num_gpus * batch_size))
@@ -692,7 +692,8 @@ data = dict(
 optimizer = dict(
     type="AdamW",
     # lr=3e-4,
-    lr=3.5e-5,
+    # lr=3.5e-5,
+    lr = 1.5e-5,
     weight_decay=0.001,
     paramwise_cfg=dict(
         custom_keys={
@@ -730,3 +731,4 @@ evaluation = dict(
 )
 # ================== pretrained model ========================
 load_from = 'ckpt/sparsedrive_stage2.pth'
+# load_from = 'work_dirs/sparsedrive_small_stage2_exp15/iter_210960.pth'

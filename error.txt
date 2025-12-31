@@ -1,0 +1,45 @@
+: 0.0022, loss_world_rec: 0.0368, loss_world_kl: 0.0001, loss_completion_recon: 0.1925, loss_pv_ssl: 0.3983, loss: 16.1218, grad_norm: 41.4961
+2025-12-30 08:28:20,018 - mmdet - INFO - Saving checkpoint at 70320 iterations
+[                                                  ] 1/6019, 0.8 task/s, elapsed: 1s, ETA:  7843sTraceback (most recent call last):
+  File "tools/train.py", line 326, in <module>
+    main()
+  File "tools/train.py", line 301, in main
+    custom_train_model(
+  File "/mnt/home/wudi/code_v3/SparseDrive/projects/mmdet3d_plugin/apis/train.py", line 29, in custom_train_model
+    custom_train_detector(
+  File "/mnt/home/wudi/code_v3/SparseDrive/projects/mmdet3d_plugin/apis/mmdet_train.py", line 219, in custom_train_detector
+    runner.run(data_loaders, cfg.workflow)
+  File "/workspace/miniconda3/envs/sparsedrive/lib/python3.8/site-packages/mmcv/runner/iter_based_runner.py", line 144, in run
+    iter_runner(iter_loaders[i], **kwargs)
+  File "/workspace/miniconda3/envs/sparsedrive/lib/python3.8/site-packages/mmcv/runner/iter_based_runner.py", line 70, in train
+    self.call_hook('after_train_iter')
+  File "/workspace/miniconda3/envs/sparsedrive/lib/python3.8/site-packages/mmcv/runner/base_runner.py", line 317, in call_hook
+    getattr(hook, fn_name)(self)
+  File "/workspace/miniconda3/envs/sparsedrive/lib/python3.8/site-packages/mmcv/runner/hooks/evaluation.py", line 266, in after_train_iter
+    self._do_evaluate(runner)
+  File "/workspace/miniconda3/envs/sparsedrive/lib/python3.8/site-packages/mmdet/core/evaluation/eval_hooks.py", line 60, in _do_evaluate
+    results = single_gpu_test(runner.model, self.dataloader, show=False)
+  File "/workspace/miniconda3/envs/sparsedrive/lib/python3.8/site-packages/mmdet/apis/test.py", line 29, in single_gpu_test
+    result = model(return_loss=False, rescale=True, **data)
+  File "/workspace/miniconda3/envs/sparsedrive/lib/python3.8/site-packages/torch/nn/modules/module.py", line 1190, in _call_impl
+    return forward_call(*input, **kwargs)
+  File "/workspace/miniconda3/envs/sparsedrive/lib/python3.8/site-packages/mmcv/parallel/data_parallel.py", line 51, in forward
+    return super().forward(*inputs, **kwargs)
+  File "/workspace/miniconda3/envs/sparsedrive/lib/python3.8/site-packages/torch/nn/parallel/data_parallel.py", line 169, in forward
+    return self.module(*inputs[0], **kwargs[0])
+  File "/workspace/miniconda3/envs/sparsedrive/lib/python3.8/site-packages/torch/nn/modules/module.py", line 1190, in _call_impl
+    return forward_call(*input, **kwargs)
+  File "/workspace/miniconda3/envs/sparsedrive/lib/python3.8/site-packages/mmcv/runner/fp16_utils.py", line 236, in new_func
+    output = old_func(*new_args, **new_kwargs)
+  File "/mnt/home/wudi/code_v3/SparseDrive/projects/mmdet3d_plugin/models/sparsedrive.py", line 1413, in forward
+    return self.forward_test(img, **data)
+  File "/mnt/home/wudi/code_v3/SparseDrive/projects/mmdet3d_plugin/models/sparsedrive.py", line 1592, in forward_test
+    return self.simple_test(img, **data)
+  File "/mnt/home/wudi/code_v3/SparseDrive/projects/mmdet3d_plugin/models/sparsedrive.py", line 1612, in simple_test
+    feature_maps = self.temporal_completion(
+  File "/workspace/miniconda3/envs/sparsedrive/lib/python3.8/site-packages/torch/nn/modules/module.py", line 1190, in _call_impl
+    return forward_call(*input, **kwargs)
+  File "/mnt/home/wudi/code_v3/SparseDrive/projects/mmdet3d_plugin/models/temporal_completion.py", line 582, in forward
+    if cam_mask is None or not cam_mask.any():
+AttributeError: 'list' object has no attribute 'any'
+(sparsedrive) root@1e38a0eda880:/mnt/home/wudi/code_v3/SparseDrive# ls
