@@ -16,6 +16,7 @@ from .detection3d import (
 from .map import *
 from .motion import *
 from .temporal_completion import MotionCompensatedTemporalCompletion
+from .temporal_completion_v2 import MotionCompensatedTemporalCompletionV2
 
 
 __all__ = [
@@ -31,4 +32,5 @@ __all__ = [
     "SparseBox3DKeyPointsGenerator",
     "SparseBox3DEncoder",
     "MotionCompensatedTemporalCompletion",
+    "MotionCompensatedTemporalCompletionV2",  # V2: 局部注意力优化版
 ]
