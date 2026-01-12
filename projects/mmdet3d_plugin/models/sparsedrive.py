@@ -1145,6 +1145,7 @@ class SparseDrive(BaseDetector):
         world_model_cfg=None,  # Dreamer 风格潜世界模型
         test_cam_missing=False,  # 测试时是否模拟相机缺失
         temporal_completion_cfg=None,  # 时序补全配置
+        planning_guided_completion_cfg=None,  # 规划引导补全配置
     ):
         super(SparseDrive, self).__init__(init_cfg=init_cfg)
 
@@ -1239,12 +1240,15 @@ class SparseDrive(BaseDetector):
         )
 
         # ===== 新增：规划引导补全模块 =====
+        if planning_guided_completion_cfg is None:
+            planning_guided_completion_cfg = {}
+        pgc_enable = planning_guided_completion_cfg.get('enable', True)
         self.planning_guided_completion = PlanningGuidedCompletion(
-            ch_per_scale=[256, 256, 256, 256],
-            hidden_dim=256,
-            use_trajectory_guidance=True,
-            use_cross_camera=True,
-            enable=True,
+            ch_per_scale=planning_guided_completion_cfg.get('ch_per_scale', [256, 256, 256, 256]),
+            hidden_dim=planning_guided_completion_cfg.get('hidden_dim', 256),
+            use_trajectory_guidance=planning_guided_completion_cfg.get('use_trajectory_guidance', True),
+            use_cross_camera=planning_guided_completion_cfg.get('use_cross_camera', True),
+            enable=pgc_enable,
         )
 
         # ===== 新增：规划反馈损失 =====

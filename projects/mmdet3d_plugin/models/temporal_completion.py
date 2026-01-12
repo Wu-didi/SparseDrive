@@ -56,6 +56,13 @@ class FeatureQueue:
         if isinstance(timestamp, torch.Tensor):
             timestamp = timestamp.item() if timestamp.numel() == 1 else timestamp[0].item()
 
+        # 场景切换检测：如果时间间隔过大，清空队列
+        if len(self.timestamp_queue) > 0:
+            time_diff = abs(timestamp - self.timestamp_queue[-1])
+            if time_diff > self.max_time_interval:
+                # 时间间隔超过阈值，可能是场景切换或数据不连续
+                self.reset()
+
         # 添加到队列（detach 避免梯度累积）
         self.feature_queue.append(feat.detach())
         self.T_global_queue.append(T_global.copy() if isinstance(T_global, np.ndarray) else T_global)

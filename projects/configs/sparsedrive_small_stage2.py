@@ -35,10 +35,29 @@ find_unused_parameters = True
 use_pv_recon = True
 
 # ===== 相机鲁棒性增强配置 =====
-# 1. 时序补全：利用历史帧预测缺失相机特征（默认启用）
-# 2. 规划导向加权：对重要相机（如前视）的补全loss加权（默认启用）
-# 3. 测试时相机遮挡：与训练保持一致（test_cam_missing=True）
-# 注：这些功能已在SparseDrive模型中默认启用，无需额外配置
+# 运动补偿时序补全模块配置
+temporal_completion_cfg = dict(
+    enable=True,                          # 是否启用时序补全
+    queue_length=2,                       # 历史帧数（显存优化：2帧）
+    reference_depths=[10, 30],            # 运动补偿的深度假设（米）
+    kv_downsample=4,                      # Key/Value空间下采样倍数（显存优化）
+    embed_dims=256,                       # 特征维度
+    num_heads=8,                          # 注意力头数
+    use_flash_attn=False,                 # 是否使用FlashAttention（需要安装）
+)
+
+# 规划引导补全模块配置
+planning_guided_completion_cfg = dict(
+    enable=True,                          # 是否启用规划引导补全
+    use_trajectory_guidance=True,         # 是否使用轨迹引导
+    use_cross_camera=True,                # 是否使用跨相机注意力
+    hidden_dim=256,                       # 隐藏层维度
+)
+
+# 注意：
+# - temporal_completion: 利用历史帧和运动补偿进行特征补全
+# - planning_guided_completion: 使用规划信息引导补全
+# - 两个模块可独立启用/禁用，用于消融实验
 
 
 # ================== model ========================
@@ -98,6 +117,8 @@ model = dict(
     use_grid_mask=True,
     use_deformable_func=use_deformable_func,
     test_cam_missing=True,  # 测试时也进行相机遮挡，和训练保持一致
+    temporal_completion_cfg=temporal_completion_cfg,  # 时序补全配置
+    planning_guided_completion_cfg=planning_guided_completion_cfg,  # 规划引导补全配置
     img_backbone=dict(
         type="ResNet",
         depth=50,
