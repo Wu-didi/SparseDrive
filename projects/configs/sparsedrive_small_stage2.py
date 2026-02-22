@@ -9,12 +9,12 @@ dist_params = dict(backend="nccl")
 log_level = "INFO"
 work_dir = None
 
-total_batch_size =4
+total_batch_size =2
 num_gpus = 1
 batch_size = total_batch_size // num_gpus
 num_iters_per_epoch = int(length[version] // (num_gpus * batch_size))
-num_epochs = 30
-checkpoint_epoch_interval = 10
+num_epochs = 20
+checkpoint_epoch_interval = 5
 
 checkpoint_config = dict(
     interval=num_iters_per_epoch * checkpoint_epoch_interval
@@ -50,8 +50,24 @@ temporal_completion_cfg = dict(
 planning_guided_completion_cfg = dict(
     enable=True,                          # 是否启用规划引导补全
     use_trajectory_guidance=True,         # 是否使用轨迹引导
+    trajectory_source="none",             # 训练/推理一致：默认不使用仅训练可见的GT轨迹
     use_cross_camera=True,                # 是否使用跨相机注意力
     hidden_dim=256,                       # 隐藏层维度
+)
+
+# 相机掉线模拟配置
+cam_dropout_cfg = dict(
+    p_missing=0.6,                        # 最终缺失概率
+    n_min=1,
+    n_max=2,
+    # 连续掉线：更接近真实传感器故障
+    sticky_fault=True,
+    sticky_min_frames=2,
+    sticky_max_frames=6,
+    # curriculum：前期轻扰动，后期增强
+    curriculum_steps=8000,
+    p_missing_start=0.15,
+    n_max_start=1,
 )
 
 # 注意：
@@ -116,7 +132,8 @@ model = dict(
     type="SparseDrive",
     use_grid_mask=True,
     use_deformable_func=use_deformable_func,
-    test_cam_missing=True,  # 测试时也进行相机遮挡，和训练保持一致
+    test_cam_missing=False,  # 标准评测默认关闭；鲁棒性评测可手动开启
+    cam_dropout_cfg=cam_dropout_cfg,
     temporal_completion_cfg=temporal_completion_cfg,  # 时序补全配置
     planning_guided_completion_cfg=planning_guided_completion_cfg,  # 规划引导补全配置
     img_backbone=dict(

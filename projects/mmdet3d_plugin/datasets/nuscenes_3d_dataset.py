@@ -2,6 +2,7 @@ import random
 import math
 import os
 from os import path as osp
+import json
 import cv2
 import tempfile
 import copy
@@ -519,7 +520,12 @@ class NuScenes3DDataset(Dataset):
         return res_path
 
     def _evaluate_single(
-        self, result_path, logger=None, result_name="img_bbox", tracking=False
+        self,
+        result_path,
+        logger=None,
+        result_name="img_bbox",
+        tracking=False,
+        return_raw=False,
     ):
         from nuscenes import NuScenes
 
@@ -581,7 +587,6 @@ class NuScenes3DDataset(Dataset):
 
             # record metrics
             metrics = mmcv.load(osp.join(output_dir, "metrics_summary.json"))
-            print(metrics)
             detail = dict()
             metric_prefix = f"{result_name}_NuScenes"
             keys = [
@@ -606,7 +611,38 @@ class NuScenes3DDataset(Dataset):
             for key in keys:
                 detail["{}/{}".format(metric_prefix, key)] = metrics[key]
 
+        if return_raw:
+            return detail, metrics
         return detail
+
+    @staticmethod
+    def _to_builtin_jsonable(obj):
+        if torch.is_tensor(obj):
+            if obj.numel() == 1:
+                return NuScenes3DDataset._to_builtin_jsonable(obj.item())
+            return NuScenes3DDataset._to_builtin_jsonable(obj.detach().cpu().tolist())
+
+        if isinstance(obj, np.ndarray):
+            return NuScenes3DDataset._to_builtin_jsonable(obj.tolist())
+
+        if isinstance(obj, np.generic):
+            return NuScenes3DDataset._to_builtin_jsonable(obj.item())
+
+        if isinstance(obj, dict):
+            return {
+                str(k): NuScenes3DDataset._to_builtin_jsonable(v)
+                for k, v in obj.items()
+            }
+
+        if isinstance(obj, (list, tuple)):
+            return [NuScenes3DDataset._to_builtin_jsonable(v) for v in obj]
+
+        if isinstance(obj, float):
+            if math.isnan(obj) or math.isinf(obj):
+                return None
+            return obj
+
+        return obj
 
     def format_results(self, results, jsonfile_prefix=None, tracking=False):
         assert isinstance(results, list), "results must be a list"
@@ -833,6 +869,7 @@ class NuScenes3DDataset(Dataset):
         mmcv.dump(results, res_path)
 
         results_dict = dict()
+        raw_metrics_dict = dict()
         if eval_mode['with_det']:
             self.tracking = eval_mode["with_tracking"]
             self.tracking_threshold = eval_mode["tracking_threshold"]
@@ -840,24 +877,28 @@ class NuScenes3DDataset(Dataset):
                 tracking = metric == "tracking"
                 if tracking and not self.tracking:
                     continue
+                metric_raw = dict()
                 result_files, tmp_dir = self.format_results(
                     results, jsonfile_prefix=self.work_dir, tracking=tracking
                 )
 
                 if isinstance(result_files, dict):
                     for name in result_names:
-                        ret_dict = self._evaluate_single(
-                            result_files[name], tracking=tracking
+                        ret_dict, raw_metric = self._evaluate_single(
+                            result_files[name], tracking=tracking, return_raw=True
                         )
-                    results_dict.update(ret_dict)
+                        results_dict.update(ret_dict)
+                        metric_raw[name] = raw_metric
                 elif isinstance(result_files, str):
-                    ret_dict = self._evaluate_single(
-                        result_files, tracking=tracking
+                    ret_dict, raw_metric = self._evaluate_single(
+                        result_files, tracking=tracking, return_raw=True
                     )
                     results_dict.update(ret_dict)
+                    metric_raw[result_names[0]] = raw_metric
 
                 if tmp_dir is not None:
                     tmp_dir.cleanup()
+                raw_metrics_dict[metric] = metric_raw
 
         if eval_mode['with_map']:
             from .evaluation.map.vector_eval import VectorEvaluate
@@ -865,17 +906,20 @@ class NuScenes3DDataset(Dataset):
             result_path = self.format_map_results(results, prefix=self.work_dir)
             map_results_dict = self.map_evaluator.evaluate(result_path, logger=logger)
             results_dict.update(map_results_dict)
+            raw_metrics_dict["map"] = map_results_dict
 
         if eval_mode['with_motion']:
             thresh = eval_mode["motion_threshhold"]
             result_files = self.format_motion_results(results, jsonfile_prefix=self.work_dir, thresh=thresh)
             motion_results_dict = self._evaluate_single_motion(result_files, self.work_dir, logger=logger)
             results_dict.update(motion_results_dict)
+            raw_metrics_dict["motion"] = motion_results_dict
         
         if eval_mode['with_planning']:
             from .evaluation.planning.planning_eval import planning_eval
             planning_results_dict = planning_eval(results, self.eval_config, logger=logger)
             results_dict.update(planning_results_dict)
+            raw_metrics_dict["planning"] = planning_results_dict
 
         if show or out_dir:
             self.show(results, save_dir=out_dir, show=show, pipeline=pipeline)
@@ -918,6 +962,19 @@ class NuScenes3DDataset(Dataset):
             metric_str += f'L2: {results_dict["L2"]:.4f}\n\n'
         
         print_log(metric_str, logger=logger)
+
+        # Save full evaluation payload for later analysis/reproducibility.
+        if self.work_dir is not None:
+            metrics_out = osp.join(self.work_dir, "e2e_metrics.json")
+            payload = dict(
+                summary_metrics=results_dict,
+                raw_metrics=raw_metrics_dict,
+                eval_mode=eval_mode,
+            )
+            payload = self._to_builtin_jsonable(payload)
+            with open(metrics_out, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+            print_log(f"Saved full metrics to {metrics_out}", logger=logger)
         return results_dict
 
     def show(self, results, save_dir=None, show=False, pipeline=None):

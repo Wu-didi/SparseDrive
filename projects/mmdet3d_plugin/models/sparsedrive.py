@@ -1,4 +1,5 @@
 from inspect import signature
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -49,53 +50,139 @@ class RandCamMask(torch.nn.Module):
                  n_min=1,
                  n_max=2,
                  train_only=True,
-                 seed: int = 42):
+                 seed: int = 42,
+                 sticky_fault: bool = False,
+                 sticky_min_frames: int = 2,
+                 sticky_max_frames: int = 6,
+                 curriculum_steps: int = 0,
+                 p_missing_start: float = None,
+                 n_max_start: int = None,
+                 state_cache_size: int = 256):
         super().__init__()
         assert 0.0 <= p_missing <= 1.0
         assert 1 <= n_min <= n_max
+        assert sticky_min_frames >= 1
+        assert sticky_min_frames <= sticky_max_frames
         self.p_missing = p_missing
         self.n_min = n_min
         self.n_max = n_max
         self.train_only = train_only
         self._seed = seed
+        self.sticky_fault = sticky_fault
+        self.sticky_min_frames = sticky_min_frames
+        self.sticky_max_frames = sticky_max_frames
+        self.curriculum_steps = max(int(curriculum_steps), 0)
+        self.p_missing_start = p_missing if p_missing_start is None else float(p_missing_start)
+        self.n_max_start = n_min if n_max_start is None else int(n_max_start)
+        self.state_cache_size = int(state_cache_size)
+        self._global_step = 0
 
         # 独立生成器，确保复现且不扰动全局 RNG
         self._g = torch.Generator()
         self._g.manual_seed(seed)
+        self._scene_fault_state = OrderedDict()
+
+    def _sample_cam_mask(self, n_cam, n_max, device):
+        n_drop = torch.randint(
+            self.n_min,
+            n_max + 1,
+            (1,),
+            generator=self._g,
+            device=device,
+        ).item()
+        drop_ids = torch.randperm(
+            n_cam,
+            generator=self._g,
+            device=device,
+        )[:n_drop]
+        cam_mask = torch.zeros(n_cam, device=device, dtype=torch.bool)
+        cam_mask[drop_ids] = True
+        return cam_mask
+
+    def _extract_scene_tokens(self, metas, batch_size):
+        scene_tokens = [None for _ in range(batch_size)]
+        img_metas = metas
+        if isinstance(metas, dict):
+            img_metas = metas.get("img_metas", None)
+        if isinstance(img_metas, list):
+            for i in range(min(batch_size, len(img_metas))):
+                token = img_metas[i].get("scene_token", None)
+                scene_tokens[i] = str(token) if token is not None else None
+        return scene_tokens
+
+    def _get_drop_policy(self, n_cam):
+        p_missing = self.p_missing
+        n_max = min(self.n_max, n_cam)
+        if self.training and self.curriculum_steps > 0:
+            ratio = min(1.0, self._global_step / float(self.curriculum_steps))
+            p_missing = self.p_missing_start + ratio * (self.p_missing - self.p_missing_start)
+            n_max_curr = int(round(self.n_max_start + ratio * (self.n_max - self.n_max_start)))
+            n_max = min(max(self.n_min, n_max_curr), n_cam)
+        p_missing = float(max(0.0, min(1.0, p_missing)))
+        return p_missing, n_max
+
+    def _get_cached_mask(self, scene_token, device):
+        state = self._scene_fault_state.get(scene_token, None)
+        if state is None:
+            return None
+        remain = state["remain"]
+        if remain <= 0:
+            self._scene_fault_state.pop(scene_token, None)
+            return None
+        state["remain"] = remain - 1
+        self._scene_fault_state.move_to_end(scene_token)
+        return state["mask"].to(device=device, dtype=torch.bool)
+
+    def _set_cached_mask(self, scene_token, cam_mask):
+        duration = torch.randint(
+            self.sticky_min_frames,
+            self.sticky_max_frames + 1,
+            (1,),
+            generator=self._g,
+            device=cam_mask.device,
+        ).item()
+        self._scene_fault_state[scene_token] = {
+            "mask": cam_mask.detach().cpu(),
+            "remain": max(duration - 1, 0),
+        }
+        self._scene_fault_state.move_to_end(scene_token)
+        while len(self._scene_fault_state) > self.state_cache_size:
+            self._scene_fault_state.popitem(last=False)
 
     @torch.no_grad()
-    def forward(self, x, return_mask: bool = False):
+    def forward(self, x, return_mask: bool = False, metas=None):
         if self.train_only and not self.training:
             return (x, None) if return_mask else x
 
         B, N_cam, C, H, W = x.shape
         device = x.device
+        if self.training:
+            self._global_step += 1
 
         # 生成器设备对齐（避免 cpu/gpu 不匹配报错）
         if getattr(self._g, "device", torch.device("cpu")).type != device.type:
             self._g = torch.Generator(device=device)
             self._g.manual_seed(self._seed)
 
-        # [B] 哪些样本触发缺失（直接在 device 上采样）
-        mask_flag = torch.rand(B, generator=self._g, device=device) < self.p_missing
-
+        p_missing, n_max = self._get_drop_policy(N_cam)
+        scene_tokens = self._extract_scene_tokens(metas, B) if self.sticky_fault else [None] * B
         cam_mask = torch.zeros(B, N_cam, device=device, dtype=torch.bool)
-        if mask_flag.any():
-            n_max = min(self.n_max, N_cam)
-            for b in torch.nonzero(mask_flag, as_tuple=False).squeeze(1):
-                n_drop = torch.randint(
-                    self.n_min,
-                    n_max + 1,
-                    (1,),
-                    generator=self._g,
-                    device=device,
-                ).item()
-                drop_ids = torch.randperm(
-                    N_cam,
-                    generator=self._g,
-                    device=device,
-                )[:n_drop]
-                cam_mask[b, drop_ids] = True
+        for b in range(B):
+            scene_token = scene_tokens[b]
+            if self.sticky_fault and scene_token is not None:
+                cached_mask = self._get_cached_mask(scene_token, device)
+                if cached_mask is not None:
+                    cam_mask[b] = cached_mask
+                    continue
+
+            trigger = torch.rand(1, generator=self._g, device=device).item() < p_missing
+            if not trigger:
+                continue
+
+            sampled = self._sample_cam_mask(N_cam, n_max, device)
+            cam_mask[b] = sampled
+            if self.sticky_fault and scene_token is not None:
+                self._set_cached_mask(scene_token, sampled)
 
         # 应用遮挡（被遮挡视角直接置 0）
         x = x * (~cam_mask).view(B, N_cam, 1, 1, 1).to(x.dtype)
@@ -185,7 +272,14 @@ class PVReconVAE(nn.Module):
         self.lambda_rec = lambda_rec
         self.lambda_kl = lambda_kl
 
-    def forward(self, feature_maps, cam_mask, metas=None):
+    def forward(
+        self,
+        feature_maps,
+        cam_mask,
+        metas=None,
+        camera_weights=None,
+        target_feature_maps=None,
+    ):
         assert cam_mask is not None, "PVReconVAE 需要 cam_mask（可以全 0）"
         B_mask, V_mask = cam_mask.shape
         outs = []
@@ -199,24 +293,49 @@ class PVReconVAE(nn.Module):
             assert B == B_mask and V == V_mask, "cam_mask 维度需与特征一致"
 
             # 展平视角维度，喂入 VAE
-            F_in = Fm.view(B * V, C, H, W)           # [B*V, C, H, W]
+            F_in = Fm.reshape(B * V, C, H, W)           # [B*V, C, H, W]
             F_detach = F_in.detach()                 # 只训练 VAE，不回传到 backbone
 
-            x_rec, mu, logvar = self.vaes[i](F_in)   # [B*V, C, H, W], [B*V, C_lat, H, W]
+            # 用 detached 输入训练补全器，避免 VAE loss 反向拉扯 backbone
+            x_rec, mu, logvar = self.vaes[i](F_detach)   # [B*V, C, H, W], [B*V, C_lat, H, W]
 
             # ---------- VAE 损失 ----------
-            # 重建损失：MSE
-            rec_loss = F.mse_loss(x_rec, F_detach)
+            # 仅在缺失相机上统计重建/KL，target 优先使用 full/teacher 特征
+            target = F_detach
+            if target_feature_maps is not None:
+                target_fm = target_feature_maps[i]
+                if target_fm.shape != Fm.shape:
+                    raise ValueError("target_feature_maps scale shape mismatch")
+                target = target_fm.detach().reshape(B * V, C, H, W)
 
-            # KL 散度（per-pixel）
+            rec_per_view = (x_rec - target).pow(2).reshape(B, V, -1).mean(dim=-1)  # [B, V]
             kl = 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar)
-            kl_loss = kl.mean()
+            kl_per_view = kl.reshape(B, V, -1).mean(dim=-1)  # [B, V]
+
+            miss = cam_mask.to(rec_per_view.device, dtype=rec_per_view.dtype)
+            has_missing = bool(miss.any().item())
+            if has_missing:
+                weight = miss
+
+                # 可选：按相机重要性做加权（[B, V]）
+                if camera_weights is not None:
+                    cam_w = camera_weights.to(weight.device, dtype=weight.dtype)
+                    if cam_w.shape != weight.shape:
+                        raise ValueError("camera_weights shape should be [B, V]")
+                    weight = weight * (1.0 + cam_w.clamp(min=0.0))
+
+                normalizer = weight.sum().clamp(min=1.0)
+                rec_loss = (rec_per_view * weight).sum() / normalizer
+                kl_loss = (kl_per_view * weight).sum() / normalizer
+            else:
+                rec_loss = rec_per_view.new_zeros(())
+                kl_loss = kl_per_view.new_zeros(())
 
             total_rec_loss = total_rec_loss + rec_loss
             total_kl_loss = total_kl_loss + kl_loss
 
             # ---------- 视角级补全 ----------
-            F_rec = x_rec.view(B, V, C, H, W)
+            F_rec = x_rec.reshape(B, V, C, H, W)
             miss = cam_mask.view(B, V, 1, 1, 1).to(Fm.dtype)  # 1=缺失
             F_out = Fm * (1.0 - miss) + F_rec * miss
 
@@ -759,23 +878,36 @@ class CrossCameraAttention(nn.Module):
     """
     跨相机注意力：缺失相机从有效相机获取信息
 
-    利用相机之间的视野重叠，从相邻相机补全缺失信息
+    采用低分辨率空间 token 的 cross-attn，保留空间结构而非全局广播。
     """
-    def __init__(self, embed_dim, num_heads=8, max_cameras=6, residual_scale=0.1):
+
+    def __init__(
+        self,
+        embed_dim,
+        num_heads=8,
+        max_cameras=6,
+        residual_scale=0.1,
+        token_hw=(8, 8),
+    ):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.max_cameras = max_cameras
         self.residual_scale = residual_scale  # 残差缩放，防止初期输出过大
+        self.token_h = int(token_hw[0])
+        self.token_w = int(token_hw[1])
 
         # 位置编码（每个相机有独立的位置编码）
         self.cam_pos_embed = nn.Parameter(torch.randn(max_cameras, embed_dim) * 0.02)
+        self.spatial_pos_embed = nn.Parameter(
+            torch.randn(1, self.token_h * self.token_w, embed_dim) * 0.02
+        )
 
         # 多头注意力
         self.attention = nn.MultiheadAttention(
             embed_dim=embed_dim,
             num_heads=num_heads,
-            batch_first=True
+            batch_first=True,
         )
 
         # 特征投影
@@ -785,7 +917,12 @@ class CrossCameraAttention(nn.Module):
         self.proj_out = nn.Linear(embed_dim, embed_dim)
 
         # 空间降维（减少计算量）
-        self.spatial_pool = nn.AdaptiveAvgPool2d((8, 8))
+        self.spatial_pool = nn.AdaptiveAvgPool2d((self.token_h, self.token_w))
+
+    def _camera_pos(self, num_cams):
+        if num_cams <= self.max_cameras:
+            return self.cam_pos_embed[:num_cams]
+        return self.cam_pos_embed.repeat((num_cams // self.max_cameras) + 1, 1)[:num_cams]
 
     def forward(self, feat, valid_mask, cam_mask):
         """
@@ -796,17 +933,14 @@ class CrossCameraAttention(nn.Module):
         B, V, C, H, W = feat.shape
         device = feat.device
 
-        # 空间降维
-        feat_pooled = self.spatial_pool(feat.view(B * V, C, H, W))  # [B*V, C, 8, 8]
-        feat_pooled = feat_pooled.view(B, V, C, -1).mean(dim=-1)  # [B, V, C]
+        # 空间降维并转 token：[B, V, C, h, w] -> [B, V, S, C]
+        feat_pooled = self.spatial_pool(feat.reshape(B * V, C, H, W))
+        feat_pooled = feat_pooled.reshape(B, V, C, self.token_h * self.token_w).permute(0, 1, 3, 2)
 
-        # 添加相机位置编码（处理相机数量不匹配的情况）
-        if V <= self.max_cameras:
-            cam_pos = self.cam_pos_embed[:V]
-        else:
-            # 如果相机数超过预设，循环使用位置编码
-            cam_pos = self.cam_pos_embed.repeat((V // self.max_cameras) + 1, 1)[:V]
-        feat_with_pos = feat_pooled + cam_pos.unsqueeze(0)  # [B, V, C]
+        cam_pos = self._camera_pos(V).to(device=device, dtype=feat_pooled.dtype)  # [V, C]
+        tokens = feat_pooled + cam_pos.view(1, V, 1, C) + self.spatial_pos_embed.to(
+            device=device, dtype=feat_pooled.dtype
+        )
 
         outputs = []
         for b in range(B):
@@ -817,29 +951,33 @@ class CrossCameraAttention(nn.Module):
                 outputs.append(feat[b])
                 continue
 
-            # Query: 缺失相机的特征
             q_indices = torch.where(missing_cams)[0]
-            q = feat_with_pos[b, q_indices]  # [N_missing, C]
-            q = self.proj_q(q).unsqueeze(0)  # [1, N_missing, C]
-
-            # Key/Value: 有效相机的特征
             kv_indices = torch.where(valid_cams)[0]
-            k = feat_with_pos[b, kv_indices]  # [N_valid, C]
-            v = feat_with_pos[b, kv_indices]
-            k = self.proj_k(k).unsqueeze(0)  # [1, N_valid, C]
-            v = self.proj_v(v).unsqueeze(0)  # [1, N_valid, C]
 
-            # 注意力
-            attn_out, _ = self.attention(q, k, v)  # [1, N_missing, C]
-            attn_out = self.proj_out(attn_out.squeeze(0))  # [N_missing, C]
+            # Key/Value: 有效相机全部空间 token
+            kv_tokens = tokens[b, kv_indices].reshape(-1, C)  # [N_valid*S, C]
+            k = self.proj_k(kv_tokens).unsqueeze(0)
+            v = self.proj_v(kv_tokens).unsqueeze(0)
 
-            # 将注意力输出扩展到空间维度并添加到原特征
             feat_b = feat[b].clone()  # [V, C, H, W]
-            for i, cam_idx in enumerate(q_indices):
-                # 将全局特征扩展到空间
-                global_feat = attn_out[i].view(C, 1, 1).expand(C, H, W)
-                # 使用残差缩放，防止初期输出过大
-                feat_b[cam_idx] = feat_b[cam_idx] + self.residual_scale * global_feat
+            for cam_idx in q_indices:
+                # Query: 缺失相机的空间 token
+                q_tokens = tokens[b, cam_idx]  # [S, C]
+                q = self.proj_q(q_tokens).unsqueeze(0)
+
+                attn_out, _ = self.attention(q, k, v)  # [1, S, C]
+                attn_out = self.proj_out(attn_out.squeeze(0))  # [S, C]
+
+                # token -> 空间图 -> 上采样回原分辨率
+                attn_map = attn_out.transpose(0, 1).reshape(C, self.token_h, self.token_w)
+                attn_map = F.interpolate(
+                    attn_map.unsqueeze(0),
+                    size=(H, W),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)
+
+                feat_b[cam_idx] = feat_b[cam_idx] + self.residual_scale * attn_map
 
             outputs.append(feat_b)
 
@@ -1141,9 +1279,10 @@ class SparseDrive(BaseDetector):
         use_grid_mask=True,
         use_deformable_func=False,
         depth_branch=None,
-        ssl_weight=1.0,        # 自监督损失权重
+        ssl_weight=0.01,       # 自监督损失权重
         world_model_cfg=None,  # Dreamer 风格潜世界模型
         test_cam_missing=False,  # 测试时是否模拟相机缺失
+        cam_dropout_cfg=None,
         temporal_completion_cfg=None,  # 时序补全配置
         planning_guided_completion_cfg=None,  # 规划引导补全配置
     ):
@@ -1176,10 +1315,23 @@ class SparseDrive(BaseDetector):
                 True, True, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.7
             )
 
-        # 随机相机失效
-        self.cam_dropout = RandCamMask(
-            p_missing=0.6, n_min=1, n_max=2, train_only=False, seed=42
+        if cam_dropout_cfg is None:
+            cam_dropout_cfg = {}
+        default_cam_dropout_cfg = dict(
+            p_missing=0.6,
+            n_min=1,
+            n_max=2,
+            train_only=False,
+            seed=42,
+            sticky_fault=True,
+            sticky_min_frames=2,
+            sticky_max_frames=6,
+            curriculum_steps=8000,
+            p_missing_start=0.15,
+            n_max_start=1,
         )
+        default_cam_dropout_cfg.update(cam_dropout_cfg)
+        self.cam_dropout = RandCamMask(**default_cam_dropout_cfg)
 
         # 是否在 test 阶段模拟相机缺失
         self.test_cam_missing = test_cam_missing
@@ -1196,8 +1348,7 @@ class SparseDrive(BaseDetector):
         # 存储 VAE loss
         self.vae_loss_dict = None
 
-        # 自监督损失权重（降低权重：从默认1.0改为0.01）
-        self.ssl_weight = ssl_weight if ssl_weight != 1.0 else 0.01
+        self.ssl_weight = ssl_weight
 
         # 轻量 Dreamer 世界模型
         enable_world_model = True
@@ -1243,6 +1394,9 @@ class SparseDrive(BaseDetector):
         if planning_guided_completion_cfg is None:
             planning_guided_completion_cfg = {}
         pgc_enable = planning_guided_completion_cfg.get('enable', True)
+        self.trajectory_source = planning_guided_completion_cfg.get('trajectory_source', 'none')
+        if self.trajectory_source not in ("none", "gt"):
+            raise ValueError("planning_guided_completion_cfg.trajectory_source must be 'none' or 'gt'")
         self.planning_guided_completion = PlanningGuidedCompletion(
             ch_per_scale=planning_guided_completion_cfg.get('ch_per_scale', [256, 256, 256, 256]),
             hidden_dim=planning_guided_completion_cfg.get('hidden_dim', 256),
@@ -1257,10 +1411,6 @@ class SparseDrive(BaseDetector):
             lambda_planning=1.0,   # 规划损失权重（主要）
             lambda_importance=0.5, # 重要性加权
         )
-
-        # 历史特征队列（用于时序补全）
-        self.feature_history = []
-        self.max_history_length = 3  # 保留最近3帧历史
 
     # -----------------------
     # 仅 backbone + neck 的特征提取
@@ -1341,12 +1491,6 @@ class SparseDrive(BaseDetector):
         for i, f in enumerate(feats):
             feats[i] = f.view(bs, num_cams, *f.shape[1:])
 
-        # 测试阶段若 cam_mask 有 True，可以用 VAE 补全
-        if cam_mask is not None:
-            cam_mask = cam_mask.to(feats[0].device, dtype=torch.bool)
-            if cam_mask.any():
-                feats, _ = self.pv_recon(feats, cam_mask, metas)
-
         depths = None
         if return_depth and self.depth_branch is not None:
             focal = None
@@ -1406,6 +1550,41 @@ class SparseDrive(BaseDetector):
 
         return total_loss * self.ssl_weight
 
+    def _extract_ego_state(self, data, device):
+        ego_state = None
+        if "can_bus" in data and data["can_bus"] is not None:
+            can_bus = data["can_bus"]
+            if isinstance(can_bus, torch.Tensor):
+                can_bus = can_bus.to(device)
+                if can_bus.dim() >= 2 and can_bus.shape[-1] >= 3:
+                    ego_state = can_bus[:, :3]
+        return ego_state
+
+    def _extract_cam_params(self, data, device):
+        cam_params = None
+        img_metas = data.get("img_metas", None)
+        if isinstance(img_metas, list) and len(img_metas) > 0 and "intrinsics" in img_metas[0]:
+            intrinsics = []
+            for meta in img_metas:
+                intr = meta.get("intrinsics", None)
+                if intr is None:
+                    intrinsics = []
+                    break
+                intrinsics.append(torch.as_tensor(intr, dtype=torch.float32, device=device))
+            if len(intrinsics) == len(img_metas):
+                cam_params = {"intrinsics": torch.stack(intrinsics, dim=0)}
+        return cam_params
+
+    def _extract_completion_trajectory(self, data, device):
+        if self.trajectory_source != "gt":
+            return None
+        traj = data.get("ego_fut_trajs", None)
+        if traj is None:
+            traj = data.get("gt_ego_fut_trajs", None)
+        if traj is None:
+            return None
+        return torch.as_tensor(traj, dtype=torch.float32, device=device)
+
     # -----------------------
     # 主 forward
     # -----------------------
@@ -1427,7 +1606,11 @@ class SparseDrive(BaseDetector):
         img_full = img.clone()
 
         # 2) 随机相机遮挡，得到 masked images + cam_mask
-        img_masked, cam_mask = self.cam_dropout(img, return_mask=True)
+        img_masked, cam_mask = self.cam_dropout(
+            img,
+            return_mask=True,
+            metas=data.get("img_metas", None),
+        )
         cam_mask = cam_mask.to(img.device)
 
         # 3) masked 分支：带梯度的 backbone+neck（student）
@@ -1458,65 +1641,25 @@ class SparseDrive(BaseDetector):
             feats_mask_base, cam_mask, metas=data
         )
 
-        # 保留旧的历史队列更新（用于其他模块，如 VAE）
-        with torch.no_grad():
-            self.feature_history.append([f.detach().clone() for f in feats_full_base])
-            if len(self.feature_history) > self.max_history_length:
-                self.feature_history.pop(0)
-
         # ===== 新增：规划导向加权 =====
         # 7) 计算相机重要性权重
-        # 尝试从data中获取ego状态（速度、加速度、角速度）
-        ego_state = None
-        if 'can_bus' in data and data['can_bus'] is not None:
-            # nuScenes的CAN bus数据包含ego状态
-            # 提取速度、加速度等信息
-            can_bus = data['can_bus']  # [B, 18] or similar
-            if can_bus.shape[-1] >= 3:
-                ego_state = can_bus[:, :3]  # 简单取前3维
-
+        ego_state = self._extract_ego_state(data, img.device)
         importance_weights = self.planning_weighting(cam_mask, ego_state)  # [B, V]
 
         # 8) VAE 视角补全（应用规划导向加权）
-        feature_maps, vae_loss = self.pv_recon(feats_temporal, cam_mask, metas=data)
-
-        # 对VAE loss应用重要性加权
-        if vae_loss is not None and importance_weights is not None:
-            # 计算每个相机的平均重要性
-            cam_weights = importance_weights.mean(dim=0)  # [V]
-            # 加权VAE重建损失（简化版：假设loss已经按相机平均）
-            # 这里只是示意，实际可能需要修改PVReconVAE内部计算
-            weight_scale = cam_weights.mean().item()
-            for key in vae_loss:
-                if 'rec' in key:  # 只对重建loss加权
-                    vae_loss[key] = vae_loss[key] * weight_scale
-
+        feature_maps, vae_loss = self.pv_recon(
+            feats_temporal,
+            cam_mask,
+            metas=data,
+            camera_weights=importance_weights,
+            target_feature_maps=feats_full_base,
+        )
         self.vae_loss_dict = vae_loss  # 用于后面合并 loss
 
         # ===== 新增：规划引导补全 =====
-        # 9) 获取 GT 轨迹用于引导补全
-        ego_trajectory = None
-        cam_params = None
-
-        # 尝试从 data 中获取 GT ego 轨迹
-        if 'ego_fut_trajs' in data and data['ego_fut_trajs'] is not None:
-            # GT ego future trajectory: [B, T, 2] (x, y)
-            ego_trajectory = data['ego_fut_trajs']
-        elif 'gt_ego_fut_trajs' in data and data['gt_ego_fut_trajs'] is not None:
-            ego_trajectory = data['gt_ego_fut_trajs']
-
-        # 获取相机参数（用于轨迹投影）
-        if 'img_metas' in data and data['img_metas'] is not None:
-            img_metas = data['img_metas']
-            if isinstance(img_metas, list) and len(img_metas) > 0:
-                # 提取 intrinsics 和 extrinsics
-                if 'intrinsics' in img_metas[0]:
-                    cam_params = {
-                        'intrinsics': torch.stack([
-                            torch.tensor(m['intrinsics']) for m in img_metas
-                        ]).to(img.device) if not isinstance(img_metas[0]['intrinsics'], torch.Tensor)
-                        else torch.stack([m['intrinsics'] for m in img_metas])
-                    }
+        # 9) 训练/推理一致：仅在显式配置 trajectory_source='gt' 时使用 GT 轨迹
+        ego_trajectory = self._extract_completion_trajectory(data, img.device)
+        cam_params = self._extract_cam_params(data, img.device)
 
         # 10) 应用规划引导补全
         planning_guided_loss = {}
@@ -1599,7 +1742,11 @@ class SparseDrive(BaseDetector):
         cam_mask = None
         # 仅在配置里开启时，才在测试阶段模拟相机缺失
         if getattr(self, "test_cam_missing", False):
-            img, cam_mask = self.cam_dropout(img, return_mask=True)
+            img, cam_mask = self.cam_dropout(
+                img,
+                return_mask=True,
+                metas=data.get("img_metas", None),
+            )
 
         # 提取特征
         feature_maps = self.extract_feat(
@@ -1610,32 +1757,35 @@ class SparseDrive(BaseDetector):
         )
 
         # ===== 新增：测试时的时序补全 =====
-        # 新版 MotionCompensatedTemporalCompletion 有内部队列，不需要外部 feature_history
-        if cam_mask is not None and cam_mask.any():
-            feature_maps_list = list(feature_maps) if isinstance(feature_maps, tuple) else feature_maps
-            with torch.no_grad():
-                feature_maps = self.temporal_completion(
-                    feature_maps_list, cam_mask, metas=data
-                )
+        # 每帧都调用以维护内部历史队列；无缺失时模块会直接旁路返回。
+        feature_maps_list = list(feature_maps) if isinstance(feature_maps, tuple) else feature_maps
+        with torch.no_grad():
+            feature_maps = self.temporal_completion(
+                feature_maps_list, cam_mask, metas=data
+            )
 
-        # ===== 新增：测试时的规划引导补全（仅跨相机注意力） =====
-        # 推理时使用跨相机注意力，不使用轨迹引导（避免两次前向）
+        # ===== 新增：测试时的 VAE + 规划引导补全 =====
         if cam_mask is not None and cam_mask.any():
             feature_maps_list = list(feature_maps) if isinstance(feature_maps, tuple) else feature_maps
+            ego_state = self._extract_ego_state(data, img.device)
+            importance_weights = self.planning_weighting(cam_mask.to(img.device), ego_state)
+            ego_trajectory = self._extract_completion_trajectory(data, img.device)
+            cam_params = self._extract_cam_params(data, img.device)
             with torch.no_grad():
-                # 使用规划引导补全，但不传入轨迹（仅利用跨相机注意力）
+                feature_maps_list, _ = self.pv_recon(
+                    feature_maps_list,
+                    cam_mask.to(img.device),
+                    metas=data,
+                    camera_weights=importance_weights,
+                )
                 feature_maps_guided, _ = self.planning_guided_completion(
-                    feature_maps_list, cam_mask, ego_trajectory=None, cam_params=None
+                    feature_maps_list,
+                    cam_mask.to(img.device),
+                    ego_trajectory=ego_trajectory,
+                    cam_params=cam_params,
                 )
             if feature_maps_guided is not None:
                 feature_maps = feature_maps_guided
-
-        # 更新历史队列（测试时也维护）
-        with torch.no_grad():
-            feat_list = list(feature_maps) if isinstance(feature_maps, tuple) else feature_maps
-            self.feature_history.append([f.detach().clone() for f in feat_list])
-            if len(self.feature_history) > self.max_history_length:
-                self.feature_history.pop(0)
 
         # 在时序补全之后，进行特征格式化（如果需要）
         if self.use_deformable_func:

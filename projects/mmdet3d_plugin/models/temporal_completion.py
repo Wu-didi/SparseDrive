@@ -31,7 +31,64 @@ class FeatureQueue:
         """重置队列"""
         self.feature_queue: List[torch.Tensor] = []  # 只存储单一尺度
         self.T_global_queue: List[np.ndarray] = []
-        self.timestamp_queue: List[float] = []
+        self.timestamp_queue: List[np.ndarray] = []
+        self.scene_token_queue: List[List[Optional[str]]] = []
+        self.batch_size: Optional[int] = None
+
+    def _extract_batch_t_global(self, metas: Dict, batch_size: int) -> np.ndarray:
+        out = np.tile(np.eye(4, dtype=np.float32)[None, ...], (batch_size, 1, 1))
+        img_metas = metas.get("img_metas", None)
+        if isinstance(img_metas, list):
+            for i in range(min(batch_size, len(img_metas))):
+                T_global = img_metas[i].get("T_global", None)
+                if T_global is not None:
+                    out[i] = np.asarray(T_global, dtype=np.float32)
+        return out
+
+    def _extract_batch_timestamps(self, metas: Dict, batch_size: int) -> np.ndarray:
+        out = np.zeros(batch_size, dtype=np.float32)
+        timestamp = metas.get("timestamp", None)
+        if isinstance(timestamp, torch.Tensor):
+            ts = timestamp.detach().cpu().float().view(-1).numpy()
+            if ts.size == 1:
+                out[:] = float(ts[0])
+            else:
+                out[:min(batch_size, ts.size)] = ts[:min(batch_size, ts.size)]
+            return out
+        if isinstance(timestamp, (list, tuple, np.ndarray)):
+            ts = np.asarray(timestamp, dtype=np.float32).reshape(-1)
+            if ts.size == 1:
+                out[:] = float(ts[0])
+            else:
+                out[:min(batch_size, ts.size)] = ts[:min(batch_size, ts.size)]
+            return out
+        if timestamp is not None:
+            out[:] = float(timestamp)
+            return out
+
+        img_metas = metas.get("img_metas", None)
+        if isinstance(img_metas, list):
+            for i in range(min(batch_size, len(img_metas))):
+                ts = img_metas[i].get("timestamp", 0.0)
+                out[i] = float(ts)
+        return out
+
+    def _extract_scene_tokens(self, metas: Dict, batch_size: int) -> List[Optional[str]]:
+        tokens: List[Optional[str]] = [None for _ in range(batch_size)]
+        img_metas = metas.get("img_metas", None)
+        if isinstance(img_metas, list):
+            for i in range(min(batch_size, len(img_metas))):
+                token = img_metas[i].get("scene_token", None)
+                tokens[i] = str(token) if token is not None else None
+        return tokens
+
+    def _scene_switched(self, prev_tokens: List[Optional[str]], cur_tokens: List[Optional[str]]) -> bool:
+        if len(prev_tokens) != len(cur_tokens):
+            return True
+        for prev, cur in zip(prev_tokens, cur_tokens):
+            if prev is not None and cur is not None and prev != cur:
+                return True
+        return False
 
     def push(self, feat: torch.Tensor, metas: Dict):
         """
@@ -41,40 +98,46 @@ class FeatureQueue:
             feat: Tensor [B, V, C, H, W]，单一尺度特征
             metas: 包含 'img_metas' 的字典
         """
-        # 获取 T_global
-        if 'img_metas' in metas and metas['img_metas'] is not None:
-            img_metas = metas['img_metas']
-            if isinstance(img_metas, list) and len(img_metas) > 0:
-                T_global = img_metas[0].get('T_global', np.eye(4))
-            else:
-                T_global = np.eye(4)
-        else:
-            T_global = np.eye(4)
+        if metas is None:
+            metas = {}
+        elif not isinstance(metas, dict):
+            metas = {"img_metas": metas} if isinstance(metas, list) else {}
 
-        # 获取时间戳
-        timestamp = metas.get('timestamp', 0.0)
-        if isinstance(timestamp, torch.Tensor):
-            timestamp = timestamp.item() if timestamp.numel() == 1 else timestamp[0].item()
+        batch_size = feat.shape[0]
+        T_global = self._extract_batch_t_global(metas, batch_size)
+        timestamp = self._extract_batch_timestamps(metas, batch_size)
+        scene_tokens = self._extract_scene_tokens(metas, batch_size)
 
-        # 场景切换检测：如果时间间隔过大，清空队列
+        # 场景切换检测：batch size 改变 / scene 改变 / 时间间隔过大都清空队列
+        if self.batch_size is not None and self.batch_size != batch_size:
+            self.reset()
         if len(self.timestamp_queue) > 0:
-            time_diff = abs(timestamp - self.timestamp_queue[-1])
-            if time_diff > self.max_time_interval:
-                # 时间间隔超过阈值，可能是场景切换或数据不连续
+            prev_ts = self.timestamp_queue[-1]
+            if prev_ts.shape[0] != batch_size:
+                self.reset()
+            else:
+                time_diff = np.abs(timestamp - prev_ts)
+                if np.any(time_diff > self.max_time_interval):
+                    self.reset()
+        if len(self.scene_token_queue) > 0:
+            if self._scene_switched(self.scene_token_queue[-1], scene_tokens):
                 self.reset()
 
         # 添加到队列（detach 避免梯度累积）
         self.feature_queue.append(feat.detach())
-        self.T_global_queue.append(T_global.copy() if isinstance(T_global, np.ndarray) else T_global)
+        self.T_global_queue.append(T_global.copy())
         self.timestamp_queue.append(timestamp)
+        self.scene_token_queue.append(scene_tokens)
+        self.batch_size = batch_size
 
         # 保持队列长度
         if len(self.feature_queue) > self.queue_length:
             self.feature_queue.pop(0)
             self.T_global_queue.pop(0)
             self.timestamp_queue.pop(0)
+            self.scene_token_queue.pop(0)
 
-    def get(self) -> Tuple[List[torch.Tensor], List[np.ndarray], List[float]]:
+    def get(self) -> Tuple[List[torch.Tensor], List[np.ndarray], List[np.ndarray]]:
         """获取历史特征和元数据"""
         return self.feature_queue, self.T_global_queue, self.timestamp_queue
 
@@ -158,64 +221,44 @@ class ImageLevelMotionWarp(nn.Module):
         scale_h = H_img / H
         scale_w = W_img / W
 
-        # 创建特征图坐标网格
+        # 创建特征图坐标网格（像素中心）
         y_feat = torch.arange(H, device=device, dtype=torch.float32)
         x_feat = torch.arange(W, device=device, dtype=torch.float32)
         yy, xx = torch.meshgrid(y_feat, x_feat, indexing='ij')
-
-        # 转换到图像坐标
         xx_img = (xx + 0.5) * scale_w
         yy_img = (yy + 0.5) * scale_h
+        ones = torch.ones_like(xx_img)
+
+        # 使用真实投影矩阵反投影，而不是启发式 FOV 近似
+        inv_lidar2img = torch.linalg.pinv(lidar2img)  # [B, 4, 4]
 
         # 收集不同深度的采样点
         grids = []
-
         for depth in self.reference_depths:
-            # 1. 图像坐标 -> 历史帧 lidar 坐标（假设深度）
-            # 简化处理：假设像素在 lidar 前方 depth 米处
-            # 实际需要使用相机内参反投影
+            depth_map = torch.full_like(xx_img, float(depth))
 
-            # 归一化图像坐标
-            u_norm = xx_img / W_img * 2 - 1  # [-1, 1]
-            v_norm = yy_img / H_img * 2 - 1  # [-1, 1]
+            # p_img_h = [u*z, v*z, z, 1]
+            pix_homo = torch.stack(
+                [xx_img * depth_map, yy_img * depth_map, depth_map, ones],
+                dim=-1,
+            )  # [H, W, 4]
+            pix_homo = pix_homo.unsqueeze(0).expand(B, -1, -1, -1).contiguous()  # [B, H, W, 4]
+            pix_homo = pix_homo.view(B, -1, 4)  # [B, H*W, 4]
 
-            # 假设的 3D 点（lidar 坐标系，前方 depth 米）
-            # 使用简化模型：x=depth, y=u_norm*depth*tan(fov/2), z=v_norm*depth*tan(fov/2)
-            fov_factor = 0.8  # 近似视场角因子
-            pts_3d = torch.stack([
-                torch.full_like(u_norm, depth),  # X (前方)
-                u_norm * depth * fov_factor,      # Y (左右)
-                v_norm * depth * fov_factor * 0.6,  # Z (上下，调整比例)
-            ], dim=-1)  # [H, W, 3]
+            # 当前帧相机像素 -> 历史帧 lidar
+            pts_hist_lidar = torch.bmm(pix_homo, inv_lidar2img.transpose(1, 2))  # [B, H*W, 4]
+            # 历史帧 lidar -> 当前帧 lidar
+            pts_cur_lidar = torch.bmm(pts_hist_lidar, T_temp2cur.transpose(1, 2))
+            # 当前帧 lidar -> 当前帧像素
+            pts_cur_img = torch.bmm(pts_cur_lidar, lidar2img.transpose(1, 2)).view(B, H, W, 4)
 
-            # 扩展到 batch
-            pts_3d = pts_3d.unsqueeze(0).expand(B, -1, -1, -1)  # [B, H, W, 3]
+            depth_proj = pts_cur_img[..., 2:3].clamp(min=1e-3)
+            pts_2d = pts_cur_img[..., :2] / depth_proj  # [B, H, W, 2]
 
-            # 2. 历史帧 3D -> 当前帧 3D (T_temp2cur)
-            pts_3d_homo = torch.cat([pts_3d, torch.ones_like(pts_3d[..., :1])], dim=-1)  # [B, H, W, 4]
-            pts_3d_homo = pts_3d_homo.view(B, -1, 4)  # [B, H*W, 4]
-
-            # 变换
-            pts_cur = torch.bmm(pts_3d_homo, T_temp2cur.transpose(1, 2))  # [B, H*W, 4]
-            pts_cur = pts_cur.view(B, H, W, 4)[..., :3]  # [B, H, W, 3]
-
-            # 3. 当前帧 3D -> 当前帧像素
-            pts_cur_homo = torch.cat([pts_cur, torch.ones_like(pts_cur[..., :1])], dim=-1)  # [B, H, W, 4]
-            pts_cur_homo = pts_cur_homo.view(B, -1, 4)  # [B, H*W, 4]
-
-            pts_img = torch.bmm(pts_cur_homo, lidar2img.transpose(1, 2))  # [B, H*W, 4]
-            pts_img = pts_img.view(B, H, W, 4)
-
-            # 透视除法
-            depth_proj = pts_img[..., 2:3].clamp(min=1e-3)
-            pts_2d = pts_img[..., :2] / depth_proj  # [B, H, W, 2]
-
-            # 归一化到 [-1, 1]
-            grid = torch.stack([
-                pts_2d[..., 0] / W_img * 2 - 1,
-                pts_2d[..., 1] / H_img * 2 - 1,
-            ], dim=-1)  # [B, H, W, 2]
-
+            grid = torch.stack(
+                [pts_2d[..., 0] / W_img * 2 - 1, pts_2d[..., 1] / H_img * 2 - 1],
+                dim=-1,
+            )  # [B, H, W, 2]
             grids.append(grid)
 
         # 加权融合
@@ -409,13 +452,31 @@ class TemporalCrossAttention(nn.Module):
         k = k.view(B, -1, self.num_heads, C // self.num_heads).transpose(1, 2)
         v_out = v_out.view(B, -1, self.num_heads, C // self.num_heads).transpose(1, 2)
 
-        # 注意力分数
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        attn = F.softmax(attn, dim=-1)
-        attn = self.dropout(attn)
+        # 相机邻接先验（更偏向同向/邻近相机）
+        cam_adj = self.camera_adjacency.to(device=device, dtype=q.dtype)
+        query_row_idx = min(query_cam_idx, cam_adj.shape[0] - 1)
+        cam_row = cam_adj[query_row_idx, :min(V, cam_adj.shape[1])]
+        if cam_row.shape[0] < V:
+            cam_row = torch.cat(
+                [cam_row, torch.ones(V - cam_row.shape[0], device=device, dtype=q.dtype) * 0.5],
+                dim=0,
+            )
+        key_cam_weight = cam_row.repeat_interleave(T * H_kv * W_kv).clamp(min=1e-4)  # [L]
+        attn_bias = key_cam_weight.log().view(1, 1, 1, -1)  # [1,1,1,L]
 
-        # 加权求和
-        out = torch.matmul(attn, v_out)
+        # 注意力分数（可选 SDPA）
+        if self.use_flash_attn and hasattr(F, "scaled_dot_product_attention"):
+            dropout_p = self.dropout.p if self.training else 0.0
+            out = F.scaled_dot_product_attention(
+                q, k, v_out, attn_mask=attn_bias, dropout_p=dropout_p, is_causal=False
+            )
+        else:
+            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+            attn = attn + attn_bias
+            attn = F.softmax(attn, dim=-1)
+            attn = self.dropout(attn)
+            out = torch.matmul(attn, v_out)
+
         out = out.transpose(1, 2).reshape(B, H * W, C)
 
         # 输出投影
@@ -563,11 +624,41 @@ class MotionCompensatedTemporalCompletion(nn.Module):
         # 默认图像尺寸
         self.img_shape = (900, 1600)
 
-    def compute_T_temp2cur(self, T_global_hist: np.ndarray, T_global_cur: np.ndarray, device) -> torch.Tensor:
-        """计算历史帧到当前帧的变换矩阵"""
-        T_global_inv_cur = np.linalg.inv(T_global_cur)
-        T_temp2cur = T_global_inv_cur @ T_global_hist
-        return torch.tensor(T_temp2cur, dtype=torch.float32, device=device)
+    def _extract_batch_t_global(self, metas: Dict, batch_size: int, device) -> torch.Tensor:
+        T_global = torch.eye(4, dtype=torch.float32, device=device).unsqueeze(0).repeat(batch_size, 1, 1)
+        img_metas = metas.get("img_metas", None)
+        if isinstance(img_metas, list):
+            for i in range(min(batch_size, len(img_metas))):
+                cur = img_metas[i].get("T_global", None)
+                if cur is not None:
+                    T_global[i] = torch.as_tensor(cur, dtype=torch.float32, device=device)
+        return T_global
+
+    def _extract_batch_lidar2img(self, metas: Dict, batch_size: int, num_cams: int, device) -> torch.Tensor:
+        out = torch.eye(4, dtype=torch.float32, device=device).view(1, 1, 4, 4).repeat(batch_size, num_cams, 1, 1)
+        img_metas = metas.get("img_metas", None)
+        if not isinstance(img_metas, list):
+            return out
+
+        for b in range(min(batch_size, len(img_metas))):
+            cur = img_metas[b].get("lidar2img", None)
+            if cur is None:
+                continue
+            cur_t = torch.as_tensor(cur, dtype=torch.float32, device=device)
+            if cur_t.dim() == 2:
+                out[b] = cur_t.unsqueeze(0).expand(num_cams, -1, -1)
+            elif cur_t.dim() == 3:
+                valid = min(num_cams, cur_t.shape[0])
+                out[b, :valid] = cur_t[:valid]
+        return out
+
+    def compute_T_temp2cur(self, T_global_hist: torch.Tensor, T_global_cur: torch.Tensor) -> torch.Tensor:
+        """计算历史帧到当前帧的变换矩阵（batch 版本）"""
+        try:
+            T_global_inv_cur = torch.linalg.inv(T_global_cur)
+        except RuntimeError:
+            T_global_inv_cur = torch.linalg.pinv(T_global_cur)
+        return torch.bmm(T_global_inv_cur, T_global_hist)
 
     def forward(self,
                 current_feats: List[torch.Tensor],
@@ -580,6 +671,11 @@ class MotionCompensatedTemporalCompletion(nn.Module):
         """
         if not self.enable:
             return current_feats
+
+        if metas is None:
+            metas = {}
+        elif not isinstance(metas, dict):
+            metas = {"img_metas": metas} if isinstance(metas, list) else {}
 
         # 获取要处理的尺度特征
         feat_process = current_feats[self.process_scale_idx]  # [B, V, C, H, W]
@@ -601,7 +697,7 @@ class MotionCompensatedTemporalCompletion(nn.Module):
                 self.feature_queue.push(feat_process, metas)
             return current_feats
 
-        # 获取当前帧的变换矩阵（带空值检查）
+        # 获取当前帧的变换矩阵（batch）
         img_metas = metas.get('img_metas', None)
         if img_metas is None or not isinstance(img_metas, list) or len(img_metas) == 0:
             # 没有有效的 img_metas，跳过时序补全
@@ -609,20 +705,8 @@ class MotionCompensatedTemporalCompletion(nn.Module):
                 self.feature_queue.push(feat_process, metas)
             return current_feats
 
-        T_global_cur = img_metas[0].get('T_global', np.eye(4))
-
-        # 获取 lidar2img
-        if 'lidar2img' in img_metas[0]:
-            lidar2img = img_metas[0]['lidar2img']
-            if isinstance(lidar2img, np.ndarray):
-                lidar2img = torch.tensor(lidar2img, dtype=torch.float32, device=device)
-            elif isinstance(lidar2img, list):
-                lidar2img = torch.tensor(np.stack(lidar2img), dtype=torch.float32, device=device)
-        else:
-            lidar2img = torch.eye(4, device=device).unsqueeze(0).expand(V, -1, -1)
-
-        if lidar2img.dim() == 3:
-            lidar2img = lidar2img.unsqueeze(0).expand(B, -1, -1, -1)
+        T_global_cur = self._extract_batch_t_global(metas, B, device)  # [B, 4, 4]
+        lidar2img = self._extract_batch_lidar2img(metas, B, V, device)  # [B, V, 4, 4]
 
         # 计算 T_temp2cur 并 warp 历史特征
         warped_history = []
@@ -630,8 +714,12 @@ class MotionCompensatedTemporalCompletion(nn.Module):
             if hist_feat.shape[0] != B:
                 continue
 
-            T_temp2cur = self.compute_T_temp2cur(T_global_hist, T_global_cur, device)
-            T_temp2cur = T_temp2cur.unsqueeze(0).expand(B, -1, -1)
+            T_global_hist = torch.as_tensor(T_global_hist, dtype=torch.float32, device=device)
+            if T_global_hist.dim() == 2:
+                T_global_hist = T_global_hist.unsqueeze(0).expand(B, -1, -1)
+            if T_global_hist.shape[0] != B:
+                continue
+            T_temp2cur = self.compute_T_temp2cur(T_global_hist, T_global_cur)
 
             # 对每个相机 warp
             warped_cams = []
