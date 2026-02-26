@@ -744,9 +744,9 @@ class PlanningGuidedCompletion(nn.Module):
 
         # 计算轨迹重要性图（如果提供了轨迹）
         traj_importance = None
-        if self.use_trajectory_guidance and ego_trajectory is not None and cam_params is not None:
+        if self.use_trajectory_guidance and ego_trajectory is not None:
             traj_importance = self.compute_trajectory_importance(
-                ego_trajectory, cam_params, feats[0].shape[-2:]
+                ego_trajectory, cam_params, feats[0].shape[-2:], num_cameras=V
             )  # [B, V, H, W]
 
         outputs = []
@@ -838,7 +838,9 @@ class PlanningGuidedCompletion(nn.Module):
 
         return feat_out
 
-    def compute_trajectory_importance(self, trajectory, cam_params, feat_size):
+    def compute_trajectory_importance(
+        self, trajectory, cam_params, feat_size, num_cameras=None
+    ):
         """
         计算规划轨迹在图像上的重要性图
 
@@ -851,9 +853,12 @@ class PlanningGuidedCompletion(nn.Module):
         B, T, _ = trajectory.shape
         H, W = feat_size
 
-        # 获取相机数量
-        if 'intrinsics' in cam_params:
-            V = cam_params['intrinsics'].shape[1] if cam_params['intrinsics'].dim() > 2 else 6
+        # 获取相机数量（优先使用当前 batch 的真实相机数）
+        if num_cameras is not None:
+            V = int(num_cameras)
+        elif isinstance(cam_params, dict) and 'intrinsics' in cam_params:
+            intr = cam_params['intrinsics']
+            V = intr.shape[1] if intr.dim() > 2 else 6
         else:
             V = 6
 
@@ -1466,7 +1471,7 @@ class SparseDrive(BaseDetector):
 
         # ===== 新增：规划反馈损失 =====
         self.planning_feedback_loss = PlanningFeedbackLoss(
-            lambda_recon=0.1,      # 重建损失权重（较低）
+            lambda_recon=0.03,     # 重建损失权重（进一步降低，避免压制主任务）
             lambda_planning=1.0,   # 规划损失权重（主要）
             lambda_importance=0.5, # 重要性加权
         )
@@ -1891,6 +1896,7 @@ class SparseDrive(BaseDetector):
         # 10) 应用规划引导补全
         planning_guided_loss = {}
         importance_maps = None
+        feature_maps_for_feedback = None
 
         if cam_mask.any():
             # 使用规划引导补全
@@ -1900,17 +1906,9 @@ class SparseDrive(BaseDetector):
 
             # 如果补全成功，使用补全后的特征
             if feature_maps_guided is not None:
-                # 计算规划引导补全的损失
-                planning_guided_loss = self.planning_feedback_loss(
-                    completed_feats=feature_maps_guided,
-                    original_feats=feats_full_base,  # GT 特征
-                    cam_mask=cam_mask,
-                    importance_maps=importance_maps,
-                    planning_loss=None  # 规划损失将在后面计算
-                )
-
                 # 使用补全后的特征继续
                 feature_maps = feature_maps_guided
+                feature_maps_for_feedback = feature_maps_guided
 
         # 11) 深度分支（如果有）
         depths = None
@@ -1929,11 +1927,21 @@ class SparseDrive(BaseDetector):
         model_outs = self.head(feats_for_head, data)
         output = self.head.loss(model_outs, data)
 
-        # ===== 端到端规划反馈说明 =====
-        # 规划损失会自动反传到补全模块，因为：
-        # 1. feature_maps_guided 没有使用 detach()
-        # 2. 梯度路径: planning_loss -> head -> feature_maps_guided -> planning_guided_completion
-        # 不需要额外添加 loss_planning_feedback，否则会重复计算
+        # 汇总 planning 分支损失，作为 completion 的反馈信号
+        planning_loss_terms = [
+            value for key, value in output.items()
+            if key.startswith("planning_loss") and torch.is_tensor(value)
+        ]
+        planning_loss_total = sum(planning_loss_terms) if planning_loss_terms else None
+
+        if feature_maps_for_feedback is not None:
+            planning_guided_loss = self.planning_feedback_loss(
+                completed_feats=feature_maps_for_feedback,
+                original_feats=feats_full_base,  # GT 特征
+                cam_mask=cam_mask,
+                importance_maps=importance_maps,
+                planning_loss=planning_loss_total,
+            )
 
         if depths is not None:
             output["loss_dense_depth"] = self.depth_branch.loss(
