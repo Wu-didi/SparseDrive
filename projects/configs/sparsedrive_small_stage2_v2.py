@@ -39,7 +39,9 @@ temporal_completion_cfg = dict(
 planning_guided_completion_cfg = dict(
     enable=True,                          # 是否启用规划引导补全
     use_trajectory_guidance=True,         # 是否使用轨迹引导
+    trajectory_source="pred",             # 使用模型预测轨迹（stop-grad）
     use_cross_camera=True,                # 是否使用跨相机注意力
+    use_conditional_completion=True,      # missing-like + valid-view 条件补全
     hidden_dim=256,                       # 隐藏层维度
 )
 

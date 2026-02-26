@@ -1,3 +1,4 @@
+import copy
 from inspect import signature
 from collections import OrderedDict
 
@@ -616,11 +617,13 @@ class PlanningGuidedCompletion(nn.Module):
                  hidden_dim=256,
                  use_trajectory_guidance=True,
                  use_cross_camera=True,
+                 use_conditional_completion=True,
                  enable=True):
         super().__init__()
         self.enable = enable
         self.use_trajectory_guidance = use_trajectory_guidance
         self.use_cross_camera = use_cross_camera
+        self.use_conditional_completion = use_conditional_completion
         self.num_scales = len(ch_per_scale)
 
         # 补全网络（每个尺度独立）
@@ -645,6 +648,23 @@ class PlanningGuidedCompletion(nn.Module):
                 nn.Conv2d(hidden_dim, 1, 1),
                 nn.Sigmoid()
             ))
+
+        # 显式条件补全：missing-view-like + valid-view 条件
+        self.conditional_nets = nn.ModuleList()
+        for c in ch_per_scale:
+            self.conditional_nets.append(nn.Sequential(
+                nn.Conv2d(c * 2, hidden_dim, 3, padding=1, bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(hidden_dim, c, 1),
+            ))
+
+        # missing-aware 表征：显式告诉网络该视角是否缺失
+        self.valid_view_embeds = nn.ParameterList()
+        self.missing_view_embeds = nn.ParameterList()
+        for c in ch_per_scale:
+            self.valid_view_embeds.append(nn.Parameter(torch.zeros(1, 1, c, 1, 1)))
+            self.missing_view_embeds.append(nn.Parameter(torch.zeros(1, 1, c, 1, 1)))
 
         # 跨相机注意力（利用其他相机的当前帧信息）
         if use_cross_camera:
@@ -690,12 +710,22 @@ class PlanningGuidedCompletion(nn.Module):
             if hasattr(net[-1], 'bias') and net[-1].bias is not None:
                 nn.init.zeros_(net[-1].bias)
 
+        for net in self.conditional_nets:
+            if hasattr(net[-1], 'weight'):
+                nn.init.normal_(net[-1].weight, mean=0, std=0.01)
+            if hasattr(net[-1], 'bias') and net[-1].bias is not None:
+                nn.init.zeros_(net[-1].bias)
+
         for net in self.gate_nets:
             # 门控网络最后一层bias初始化为负值，使初始 sigmoid(x) ≈ 0.1
             # 这样初期主要使用原始特征，补全特征只有小权重
             # sigmoid(-2.2) ≈ 0.1
             if hasattr(net[-2], 'bias') and net[-2].bias is not None:
                 nn.init.constant_(net[-2].bias, -2.0)
+
+        for valid_embed, missing_embed in zip(self.valid_view_embeds, self.missing_view_embeds):
+            nn.init.zeros_(valid_embed)
+            nn.init.normal_(missing_embed, mean=0, std=0.02)
 
     def forward(self, feats, cam_mask, ego_trajectory=None, cam_params=None):
         """
@@ -724,6 +754,15 @@ class PlanningGuidedCompletion(nn.Module):
 
         for scale_idx, feat in enumerate(feats):
             B, V, C, H, W = feat.shape
+            feat_base = feat
+
+            # missing-aware：给每个视角注入缺失状态 embedding
+            cam_mask_float = cam_mask.view(B, V, 1, 1, 1).to(dtype=feat.dtype)
+            feat = (
+                feat_base
+                + (1.0 - cam_mask_float) * self.valid_view_embeds[scale_idx]
+                + cam_mask_float * self.missing_view_embeds[scale_idx]
+            )
 
             # 1. 跨相机注意力（利用有效相机的信息）
             if self.use_cross_camera:
@@ -733,7 +772,8 @@ class PlanningGuidedCompletion(nn.Module):
             else:
                 feat_cross = feat
 
-            # 2. 展平处理
+            # 2. 展平处理（base: 保持原始分布；feat_flat: 补全网络输入）
+            feat_base_flat = feat_base.view(B * V, C, H, W)
             feat_flat = feat_cross.view(B * V, C, H, W)
 
             # 3. 基础补全
@@ -741,6 +781,19 @@ class PlanningGuidedCompletion(nn.Module):
 
             # 4. 精细补全（用于轨迹区域）
             completed_fine = self.fine_completion_nets[scale_idx](feat_flat)
+
+            # 4.1 显式条件补全：利用 valid-view 的条件统计
+            if self.use_conditional_completion:
+                valid = (~cam_mask).view(B, V, 1, 1, 1).to(dtype=feat_cross.dtype)
+                valid_count = valid.sum(dim=1).clamp(min=1.0)
+                cond_view = (feat_cross * valid).sum(dim=1) / valid_count  # [B, C, H, W]
+                cond_view = cond_view.unsqueeze(1).expand(-1, V, -1, -1, -1)
+                cond_flat = cond_view.reshape(B * V, C, H, W)
+                cond_completed = self.conditional_nets[scale_idx](
+                    torch.cat([feat_flat, cond_flat], dim=1)
+                )
+                completed_coarse = completed_coarse + cond_completed
+                completed_fine = completed_fine + cond_completed
 
             # 5. 根据轨迹重要性混合粗糙/精细补全
             if traj_importance is not None:
@@ -757,14 +810,14 @@ class PlanningGuidedCompletion(nn.Module):
                 importance = torch.ones(B, V, H, W, device=device) * 0.5
 
             # 6. 门控融合（学习原始特征和补全特征的最优混合）
-            gate_input = torch.cat([feat_flat, completed], dim=1)
+            gate_input = torch.cat([feat_base_flat, completed], dim=1)
             gate = self.gate_nets[scale_idx](gate_input)  # [B*V, 1, H, W]
 
-            fused = feat_flat * (1 - gate) + completed * gate
+            fused = feat_base_flat * (1 - gate) + completed * gate
 
             # 7. 只对被遮挡的相机应用补全
             mask = cam_mask.view(B * V, 1, 1, 1).float()
-            output = feat_flat * (1 - mask) + fused * mask
+            output = feat_base_flat * (1 - mask) + fused * mask
 
             outputs.append(output.view(B, V, C, H, W))
             importance_maps.append(importance)
@@ -902,6 +955,7 @@ class CrossCameraAttention(nn.Module):
         self.spatial_pos_embed = nn.Parameter(
             torch.randn(1, self.token_h * self.token_w, embed_dim) * 0.02
         )
+        self.mask_status_embed = nn.Parameter(torch.randn(2, embed_dim) * 0.02)
 
         # 多头注意力
         self.attention = nn.MultiheadAttention(
@@ -941,6 +995,10 @@ class CrossCameraAttention(nn.Module):
         tokens = feat_pooled + cam_pos.view(1, V, 1, C) + self.spatial_pos_embed.to(
             device=device, dtype=feat_pooled.dtype
         )
+        status_embed = self.mask_status_embed[
+            cam_mask.to(device=device, dtype=torch.long).clamp(min=0, max=1)
+        ].unsqueeze(2)
+        tokens = tokens + status_embed.to(dtype=tokens.dtype)
 
         outputs = []
         for b in range(B):
@@ -1394,14 +1452,15 @@ class SparseDrive(BaseDetector):
         if planning_guided_completion_cfg is None:
             planning_guided_completion_cfg = {}
         pgc_enable = planning_guided_completion_cfg.get('enable', True)
-        self.trajectory_source = planning_guided_completion_cfg.get('trajectory_source', 'none')
-        if self.trajectory_source not in ("none", "gt"):
-            raise ValueError("planning_guided_completion_cfg.trajectory_source must be 'none' or 'gt'")
+        self.trajectory_source = planning_guided_completion_cfg.get('trajectory_source', 'pred')
+        if self.trajectory_source not in ("none", "gt", "pred"):
+            raise ValueError("planning_guided_completion_cfg.trajectory_source must be 'none'/'gt'/'pred'")
         self.planning_guided_completion = PlanningGuidedCompletion(
             ch_per_scale=planning_guided_completion_cfg.get('ch_per_scale', [256, 256, 256, 256]),
             hidden_dim=planning_guided_completion_cfg.get('hidden_dim', 256),
             use_trajectory_guidance=planning_guided_completion_cfg.get('use_trajectory_guidance', True),
             use_cross_camera=planning_guided_completion_cfg.get('use_cross_camera', True),
+            use_conditional_completion=planning_guided_completion_cfg.get('use_conditional_completion', True),
             enable=pgc_enable,
         )
 
@@ -1575,9 +1634,173 @@ class SparseDrive(BaseDetector):
                 cam_params = {"intrinsics": torch.stack(intrinsics, dim=0)}
         return cam_params
 
-    def _extract_completion_trajectory(self, data, device):
-        if self.trajectory_source != "gt":
+    def _clone_runtime_obj(self, obj):
+        if torch.is_tensor(obj):
+            return obj.clone()
+        if isinstance(obj, list):
+            return [self._clone_runtime_obj(x) for x in obj]
+        if isinstance(obj, tuple):
+            return tuple(self._clone_runtime_obj(x) for x in obj)
+        if isinstance(obj, dict):
+            return {k: self._clone_runtime_obj(v) for k, v in obj.items()}
+        return copy.deepcopy(obj)
+
+    def _capture_head_runtime_state(self):
+        runtime_state = {}
+        head = getattr(self, "head", None)
+        if head is None:
+            return runtime_state
+
+        def capture_instance_bank(sub_head, key_prefix):
+            if sub_head is None or not hasattr(sub_head, "instance_bank"):
+                return
+            bank = sub_head.instance_bank
+            bank_keys = [
+                "cached_feature", "cached_anchor", "metas", "mask",
+                "confidence", "temp_confidence", "instance_id", "prev_id",
+            ]
+            instance_state = {}
+            for k in bank_keys:
+                value = getattr(bank, k, None)
+                instance_state[k] = value if k == "metas" else self._clone_runtime_obj(value)
+            runtime_state[f"{key_prefix}_instance_bank"] = instance_state
+
+        def capture_sampler(sub_head, key_prefix):
+            if sub_head is None or not hasattr(sub_head, "sampler"):
+                return
+            runtime_state[f"{key_prefix}_sampler_dn_metas"] = self._clone_runtime_obj(
+                getattr(sub_head.sampler, "dn_metas", None)
+            )
+
+        det_head = getattr(head, "det_head", None)
+        map_head = getattr(head, "map_head", None)
+        capture_instance_bank(det_head, "det")
+        capture_instance_bank(map_head, "map")
+        capture_sampler(det_head, "det")
+        capture_sampler(map_head, "map")
+
+        motion_head = getattr(head, "motion_plan_head", None)
+        if motion_head is not None and hasattr(motion_head, "instance_queue"):
+            queue = motion_head.instance_queue
+            queue_keys = [
+                "metas", "prev_instance_id", "prev_confidence", "period",
+                "instance_feature_queue", "anchor_queue", "prev_ego_status",
+                "ego_period", "ego_feature_queue", "ego_anchor_queue",
+            ]
+            queue_state = {}
+            for k in queue_keys:
+                value = getattr(queue, k, None)
+                queue_state[k] = value if k == "metas" else self._clone_runtime_obj(value)
+            runtime_state["motion_instance_queue"] = queue_state
+
+        return runtime_state
+
+    def _restore_head_runtime_state(self, runtime_state):
+        head = getattr(self, "head", None)
+        if head is None or not runtime_state:
+            return
+
+        def restore_instance_bank(sub_head, key_prefix):
+            key = f"{key_prefix}_instance_bank"
+            if sub_head is None or not hasattr(sub_head, "instance_bank") or key not in runtime_state:
+                return
+            for attr, value in runtime_state[key].items():
+                setattr(sub_head.instance_bank, attr, value)
+
+        def restore_sampler(sub_head, key_prefix):
+            key = f"{key_prefix}_sampler_dn_metas"
+            if sub_head is None or not hasattr(sub_head, "sampler") or key not in runtime_state:
+                return
+            setattr(sub_head.sampler, "dn_metas", runtime_state[key])
+
+        det_head = getattr(head, "det_head", None)
+        map_head = getattr(head, "map_head", None)
+        restore_instance_bank(det_head, "det")
+        restore_instance_bank(map_head, "map")
+        restore_sampler(det_head, "det")
+        restore_sampler(map_head, "map")
+
+        motion_head = getattr(head, "motion_plan_head", None)
+        if (
+            motion_head is not None
+            and hasattr(motion_head, "instance_queue")
+            and "motion_instance_queue" in runtime_state
+        ):
+            for attr, value in runtime_state["motion_instance_queue"].items():
+                setattr(motion_head.instance_queue, attr, value)
+
+    def _decode_predicted_trajectory(self, model_outs):
+        if not isinstance(model_outs, (list, tuple)) or len(model_outs) < 4:
             return None
+        planning_output = model_outs[3]
+        if not isinstance(planning_output, dict):
+            return None
+        cls_seq = planning_output.get("classification", None)
+        reg_seq = planning_output.get("prediction", None)
+        if not cls_seq or not reg_seq:
+            return None
+
+        plan_cls = cls_seq[-1]
+        plan_reg = reg_seq[-1]
+        if plan_cls is None or plan_reg is None:
+            return None
+
+        if plan_cls.dim() == 3:
+            plan_cls = plan_cls.squeeze(1)
+        elif plan_cls.dim() > 2:
+            plan_cls = plan_cls.reshape(plan_cls.shape[0], -1)
+
+        if plan_reg.dim() == 5:
+            plan_reg = plan_reg.squeeze(1)
+        elif plan_reg.dim() > 4:
+            plan_reg = plan_reg.reshape(plan_reg.shape[0], -1, plan_reg.shape[-2], plan_reg.shape[-1])
+
+        if plan_cls.dim() != 2 or plan_reg.dim() != 4:
+            return None
+
+        num_modes = min(plan_cls.shape[1], plan_reg.shape[1])
+        if num_modes <= 0:
+            return None
+
+        plan_cls = plan_cls[:, :num_modes]
+        plan_reg = plan_reg[:, :num_modes]
+
+        mode_idx = plan_cls.sigmoid().argmax(dim=-1)
+        batch_idx = torch.arange(plan_cls.shape[0], device=plan_cls.device)
+        traj_delta = plan_reg[batch_idx, mode_idx]  # [B, T, 2]
+        return traj_delta.cumsum(dim=-2).detach()
+
+    def _extract_predicted_trajectory(self, feature_maps, data):
+        if feature_maps is None:
+            return None
+
+        runtime_state = self._capture_head_runtime_state()
+        feats_for_head = feature_maps
+        if self.use_deformable_func:
+            feats_for_head = feature_maps_format(feats_for_head)
+
+        try:
+            cuda_devices = [torch.cuda.current_device()] if torch.cuda.is_available() else []
+            with torch.random.fork_rng(devices=cuda_devices, enabled=True):
+                with torch.no_grad():
+                    model_outs = self.head(feats_for_head, data)
+                    traj = self._decode_predicted_trajectory(model_outs)
+        finally:
+            self._restore_head_runtime_state(runtime_state)
+
+        return traj
+
+    def _extract_completion_trajectory(self, data, device, feature_maps=None):
+        if self.trajectory_source == "none":
+            return None
+
+        if self.trajectory_source == "pred":
+            traj_pred = self._extract_predicted_trajectory(feature_maps, data)
+            if traj_pred is None:
+                return None
+            return traj_pred.to(device=device, dtype=torch.float32)
+
+        # trajectory_source == "gt"
         traj = data.get("ego_fut_trajs", None)
         if traj is None:
             traj = data.get("gt_ego_fut_trajs", None)
@@ -1657,8 +1880,12 @@ class SparseDrive(BaseDetector):
         self.vae_loss_dict = vae_loss  # 用于后面合并 loss
 
         # ===== 新增：规划引导补全 =====
-        # 9) 训练/推理一致：仅在显式配置 trajectory_source='gt' 时使用 GT 轨迹
-        ego_trajectory = self._extract_completion_trajectory(data, img.device)
+        # 9) 轨迹来源由 trajectory_source 控制：none / gt / pred（pred 使用 stop-grad）
+        ego_trajectory = self._extract_completion_trajectory(
+            data,
+            img.device,
+            feature_maps=feature_maps,
+        )
         cam_params = self._extract_cam_params(data, img.device)
 
         # 10) 应用规划引导补全
@@ -1769,7 +1996,6 @@ class SparseDrive(BaseDetector):
             feature_maps_list = list(feature_maps) if isinstance(feature_maps, tuple) else feature_maps
             ego_state = self._extract_ego_state(data, img.device)
             importance_weights = self.planning_weighting(cam_mask.to(img.device), ego_state)
-            ego_trajectory = self._extract_completion_trajectory(data, img.device)
             cam_params = self._extract_cam_params(data, img.device)
             with torch.no_grad():
                 feature_maps_list, _ = self.pv_recon(
@@ -1777,6 +2003,11 @@ class SparseDrive(BaseDetector):
                     cam_mask.to(img.device),
                     metas=data,
                     camera_weights=importance_weights,
+                )
+                ego_trajectory = self._extract_completion_trajectory(
+                    data,
+                    img.device,
+                    feature_maps=feature_maps_list,
                 )
                 feature_maps_guided, _ = self.planning_guided_completion(
                     feature_maps_list,

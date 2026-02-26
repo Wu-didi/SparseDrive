@@ -602,6 +602,12 @@ class MotionCompensatedTemporalCompletion(nn.Module):
         self.feat_adapter = nn.Conv2d(process_ch, embed_dims, 1) if process_ch != embed_dims else nn.Identity()
         self.out_adapter = nn.Conv2d(embed_dims, process_ch, 1) if process_ch != embed_dims else nn.Identity()
 
+        # missing-aware 表征：显式区分有效/缺失视角
+        self.valid_cam_embed = nn.Parameter(torch.zeros(1, 1, process_ch, 1, 1))
+        self.missing_cam_embed = nn.Parameter(torch.zeros(1, 1, process_ch, 1, 1))
+        nn.init.zeros_(self.valid_cam_embed)
+        nn.init.normal_(self.missing_cam_embed, mean=0, std=0.02)
+
         # 空间解码器（轻量版）
         self.spatial_decoder = nn.Sequential(
             nn.Conv2d(embed_dims, embed_dims, 3, padding=1, bias=False),
@@ -611,6 +617,21 @@ class MotionCompensatedTemporalCompletion(nn.Module):
         )
         nn.init.normal_(self.spatial_decoder[-1].weight, mean=0, std=0.01)
         nn.init.zeros_(self.spatial_decoder[-1].bias)
+
+        # 条件补全：当前有效视角 + 历史上下文
+        self.cond_fusion = nn.Sequential(
+            nn.Conv2d(embed_dims * 2, embed_dims, 1, bias=False),
+            nn.BatchNorm2d(embed_dims),
+            nn.ReLU(inplace=True),
+        )
+        self.conditional_completion = nn.Sequential(
+            nn.Conv2d(embed_dims * 2, embed_dims, 3, padding=1, bias=False),
+            nn.BatchNorm2d(embed_dims),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(embed_dims, embed_dims, 1),
+        )
+        nn.init.normal_(self.conditional_completion[-1].weight, mean=0, std=0.01)
+        nn.init.zeros_(self.conditional_completion[-1].bias)
 
         # 门控融合
         self.gate = nn.Sequential(
@@ -678,15 +699,24 @@ class MotionCompensatedTemporalCompletion(nn.Module):
             metas = {"img_metas": metas} if isinstance(metas, list) else {}
 
         # 获取要处理的尺度特征
-        feat_process = current_feats[self.process_scale_idx]  # [B, V, C, H, W]
-        B, V, C, H, W = feat_process.shape
-        device = feat_process.device
+        feat_process_raw = current_feats[self.process_scale_idx]  # [B, V, C, H, W]
+        B, V, C, H, W = feat_process_raw.shape
+        device = feat_process_raw.device
 
         if cam_mask is None or not cam_mask.any():
             # 没有失效相机，更新队列后直接返回
             with torch.no_grad():
-                self.feature_queue.push(feat_process, metas)
+                self.feature_queue.push(feat_process_raw, metas)
             return current_feats
+        cam_mask = cam_mask.to(device=device, dtype=torch.bool)
+
+        # missing-aware 表征：显式注入缺失状态
+        cam_mask_float = cam_mask.view(B, V, 1, 1, 1).to(dtype=feat_process_raw.dtype)
+        feat_process = (
+            feat_process_raw
+            + (1.0 - cam_mask_float) * self.valid_cam_embed
+            + cam_mask_float * self.missing_cam_embed
+        )
 
         # 获取历史特征
         history_feats, T_global_queue, _ = self.feature_queue.get()
@@ -694,7 +724,7 @@ class MotionCompensatedTemporalCompletion(nn.Module):
         if len(history_feats) == 0:
             # 没有历史帧，更新队列后返回原始特征
             with torch.no_grad():
-                self.feature_queue.push(feat_process, metas)
+                self.feature_queue.push(feat_process_raw, metas)
             return current_feats
 
         # 获取当前帧的变换矩阵（batch）
@@ -702,7 +732,7 @@ class MotionCompensatedTemporalCompletion(nn.Module):
         if img_metas is None or not isinstance(img_metas, list) or len(img_metas) == 0:
             # 没有有效的 img_metas，跳过时序补全
             with torch.no_grad():
-                self.feature_queue.push(feat_process, metas)
+                self.feature_queue.push(feat_process_raw, metas)
             return current_feats
 
         T_global_cur = self._extract_batch_t_global(metas, B, device)  # [B, 4, 4]
@@ -731,7 +761,7 @@ class MotionCompensatedTemporalCompletion(nn.Module):
 
         if len(warped_history) == 0:
             with torch.no_grad():
-                self.feature_queue.push(feat_process, metas)
+                self.feature_queue.push(feat_process_raw, metas)
             return current_feats
 
         # 堆叠历史帧 [B, V, T, C, H, W]
@@ -743,8 +773,20 @@ class MotionCompensatedTemporalCompletion(nn.Module):
         embed_dims = warped_adapted.shape[1]
         warped_adapted = warped_adapted.view(B, V, T_actual, embed_dims, H, W)
 
+        # 当前帧 valid-view 条件
+        current_adapted = self.feat_adapter(feat_process.view(B * V, C, H, W)).view(B, V, embed_dims, H, W)
+        valid_mask = (~cam_mask).view(B, V, 1, 1, 1).to(dtype=current_adapted.dtype)
+        valid_count = valid_mask.sum(dim=1).clamp(min=1.0)
+        cond_current = (current_adapted * valid_mask).sum(dim=1) / valid_count  # [B, C, H, W]
+
+        # 历史条件（仅聚合有效视角）
+        valid_mask_hist = (~cam_mask).view(B, V, 1, 1, 1, 1).to(dtype=warped_adapted.dtype)
+        hist_count = (valid_mask_hist.sum(dim=1) * max(T_actual, 1)).squeeze(1).clamp(min=1.0)
+        cond_history = (warped_adapted * valid_mask_hist).sum(dim=1).sum(dim=1) / hist_count
+        cond_context = self.cond_fusion(torch.cat([cond_current, cond_history], dim=1))
+
         # 对每个失效相机进行补全
-        feat_out = feat_process.clone()
+        feat_out = feat_process_raw.clone()
 
         for v in range(V):
             missing_mask = cam_mask[:, v]
@@ -758,6 +800,10 @@ class MotionCompensatedTemporalCompletion(nn.Module):
                 H=H, W=W,
             )
 
+            # 条件补全：missing-view-like + (valid-view + history) 条件
+            cond_input = torch.cat([current_adapted[:, v], cond_context], dim=1)
+            completed = completed + self.conditional_completion(cond_input)
+
             # 空间解码
             completed = self.spatial_decoder(completed)
 
@@ -765,9 +811,9 @@ class MotionCompensatedTemporalCompletion(nn.Module):
             completed = self.out_adapter(completed)
 
             # 门控融合
-            gate_input = torch.cat([feat_process[:, v], completed], dim=1)
+            gate_input = torch.cat([feat_process_raw[:, v], completed], dim=1)
             gate = self.gate(gate_input)
-            fused = feat_process[:, v] * (1 - gate) + completed * gate
+            fused = feat_process_raw[:, v] * (1 - gate) + completed * gate
 
             # 只替换失效的 batch
             mask = missing_mask.view(B, 1, 1, 1).float()
@@ -775,7 +821,8 @@ class MotionCompensatedTemporalCompletion(nn.Module):
 
         # 更新历史队列
         with torch.no_grad():
-            self.feature_queue.push(feat_process, metas)
+            # 将补全结果写入记忆，减少缺失特征在队列中传播
+            self.feature_queue.push(feat_out, metas)
 
         # 构建输出：只更新处理的尺度
         outputs = list(current_feats)

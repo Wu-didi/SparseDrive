@@ -11,7 +11,7 @@ dist_test/
 vis/
 val/
 lib/
-
+work_dirs/
 *.egg-info
 build/
 __pycache__/
