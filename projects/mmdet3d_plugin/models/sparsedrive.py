@@ -1343,6 +1343,7 @@ class SparseDrive(BaseDetector):
         cam_dropout_cfg=None,
         temporal_completion_cfg=None,  # 时序补全配置
         planning_guided_completion_cfg=None,  # 规划引导补全配置
+        frozen_modules=None,   # 冻结模块名列表，支持 "a.b.c" 点分路径
     ):
         super(SparseDrive, self).__init__(init_cfg=init_cfg)
 
@@ -1470,6 +1471,40 @@ class SparseDrive(BaseDetector):
             lambda_planning=1.0,   # 规划损失权重（主要）
             lambda_importance=0.5, # 重要性加权
         )
+
+        # ===== 模块冻结 =====
+        self._frozen_modules = frozen_modules or []
+        if self._frozen_modules:
+            self._freeze_modules()
+
+    def _get_submodule(self, name):
+        """通过点分路径获取子模块，如 'head.det_head'"""
+        obj = self
+        for attr in name.split('.'):
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                return None
+        return obj
+
+    def _freeze_modules(self):
+        for name in self._frozen_modules:
+            module = self._get_submodule(name)
+            if module is None:
+                import warnings
+                warnings.warn(f"[SparseDrive] frozen_modules: '{name}' not found, skipped.")
+                continue
+            for param in module.parameters():
+                param.requires_grad = False
+            module.eval()
+
+    def train(self, mode=True):
+        super(SparseDrive, self).train(mode)
+        # 保证冻结模块始终处于 eval 模式（避免 BN 统计被更新）
+        for name in self._frozen_modules:
+            module = self._get_submodule(name)
+            if module is not None:
+                module.eval()
+        return self
 
     # -----------------------
     # 仅 backbone + neck 的特征提取

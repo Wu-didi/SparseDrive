@@ -137,6 +137,20 @@ model = dict(
     cam_dropout_cfg=cam_dropout_cfg,
     temporal_completion_cfg=temporal_completion_cfg,  # 时序补全配置
     planning_guided_completion_cfg=planning_guided_completion_cfg,  # 规划引导补全配置
+    # 冻结除 motion_plan_head 外的所有模块，专门微调轨迹预测分支以提升 L2 指标
+    frozen_modules=[
+        "img_backbone",
+        "img_neck",
+        "depth_branch",
+        "pv_recon",
+        "world_model",
+        "temporal_completion",
+        "planning_weighting",
+        "planning_guided_completion",
+        "planning_feedback_loss",
+        "head.det_head",
+        "head.map_head",
+    ],
     img_backbone=dict(
         type="ResNet",
         depth=50,
