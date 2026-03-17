@@ -7,7 +7,7 @@ plugin = True
 plugin_dir = "projects/mmdet3d_plugin/"
 dist_params = dict(backend="nccl")
 log_level = "INFO"
-work_dir = None
+work_dir = "./work_dirs/sparsedrive_small_stage2_exp22"
 
 total_batch_size =2
 num_gpus = 1
@@ -783,5 +783,5 @@ evaluation = dict(
     eval_mode=eval_mode,
 )
 # ================== pretrained model ========================
-load_from = 'ckpt/sparsedrive_stage2.pth'
-# load_from = 'work_dirs/sparsedrive_small_stage2_exp15/iter_210960.pth'
+load_from = 'work_dirs/sparsedrive_small_stage2_exp20/iter_281300.pth'
+# load_from = 'work_dirs/sparsedrive_small_stage2_exp20/latest.pth'

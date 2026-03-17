@@ -1,4 +1,5 @@
 import copy
+import math
 from inspect import signature
 from collections import OrderedDict
 
@@ -191,7 +192,7 @@ class RandCamMask(torch.nn.Module):
 
 
 # ===========================================
-# 2) 视角级特征补全（VAE）
+# 2) 视角级特征补全（VAE / Flow Matching）
 # ===========================================
 class SimpleFeatureVAE(nn.Module):
     """
@@ -347,6 +348,300 @@ class PVReconVAE(nn.Module):
             "loss_pv_vae_kl": self.lambda_kl * total_kl_loss,
         }
         return outs, loss_dict
+
+
+def _build_group_norm(num_channels, max_groups=8):
+    num_groups = min(max_groups, num_channels)
+    while num_groups > 1 and num_channels % num_groups != 0:
+        num_groups -= 1
+    return nn.GroupNorm(num_groups, num_channels)
+
+
+class SinusoidalTimeEmbedding(nn.Module):
+    def __init__(self, embed_dims=128):
+        super().__init__()
+        if embed_dims % 2 != 0:
+            raise ValueError("SinusoidalTimeEmbedding requires an even embed_dims")
+        self.embed_dims = embed_dims
+
+    def forward(self, t):
+        t = t.reshape(-1, 1)
+        half = self.embed_dims // 2
+        if half <= 0:
+            raise ValueError("embed_dims must be >= 2")
+        if half == 1:
+            freq = torch.ones(1, device=t.device, dtype=t.dtype)
+        else:
+            freq = torch.exp(
+                torch.arange(half, device=t.device, dtype=t.dtype)
+                * (-math.log(10000.0) / float(half - 1))
+            )
+        angles = t * freq.unsqueeze(0)
+        return torch.cat([angles.sin(), angles.cos()], dim=-1)
+
+
+class SimpleFeatureFlow(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        hidden_channels=128,
+        time_embed_dim=128,
+        num_cameras=6,
+        use_camera_embed=True,
+    ):
+        super().__init__()
+        self.time_embed = SinusoidalTimeEmbedding(time_embed_dim)
+        self.time_proj = nn.Sequential(
+            nn.Linear(time_embed_dim, hidden_channels),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden_channels, hidden_channels),
+        )
+        self.camera_embed = (
+            nn.Embedding(num_cameras, hidden_channels)
+            if use_camera_embed
+            else None
+        )
+
+        input_channels = in_channels * 3 + 1
+        self.stem = nn.Sequential(
+            nn.Conv2d(input_channels, hidden_channels, 3, padding=1, bias=False),
+            _build_group_norm(hidden_channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden_channels, hidden_channels, 3, padding=1, bias=False),
+            _build_group_norm(hidden_channels),
+            nn.SiLU(inplace=True),
+        )
+        self.head = nn.Sequential(
+            nn.Conv2d(hidden_channels, hidden_channels, 3, padding=1, bias=False),
+            _build_group_norm(hidden_channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden_channels, in_channels, 1),
+        )
+
+    def forward(self, x_t, source, context, miss_mask, time, camera_ids=None):
+        hidden = self.stem(torch.cat([x_t, source, context, miss_mask], dim=1))
+        time_feat = self.time_proj(self.time_embed(time)).unsqueeze(-1).unsqueeze(-1)
+        time_feat = time_feat.to(hidden.dtype)
+        hidden = hidden + time_feat
+        if self.camera_embed is not None and camera_ids is not None:
+            camera_feat = self.camera_embed(camera_ids).unsqueeze(-1).unsqueeze(-1)
+            hidden = hidden + camera_feat.to(hidden.dtype)
+        return self.head(hidden)
+
+
+class FeatureFlowReconstructor(nn.Module):
+    """
+    多尺度、多视角条件 flow matching 重建模块。
+
+    输入:
+      feature_maps: List[Tensor]，每尺度 [B, V, C, H, W]
+      cam_mask    : [B, V] bool，True=该视角缺失
+
+    输出:
+      outs        : List[Tensor]，与 feature_maps 同形状，
+                    cam_mask=True 的位置用 flow 重建特征替换
+      loss_dict   : {'loss_pv_flow': ...}
+    """
+
+    def __init__(
+        self,
+        ch_per_scale,
+        hidden_channels=128,
+        time_embed_dim=128,
+        lambda_flow=0.01,
+        num_integration_steps=4,
+        num_cameras=6,
+        use_camera_embed=True,
+        detach_inputs=True,
+    ):
+        super().__init__()
+        if not isinstance(ch_per_scale, (list, tuple)):
+            raise TypeError("ch_per_scale should be a list or tuple")
+        self.predictors = nn.ModuleList(
+            [
+                SimpleFeatureFlow(
+                    c,
+                    hidden_channels=hidden_channels,
+                    time_embed_dim=time_embed_dim,
+                    num_cameras=num_cameras,
+                    use_camera_embed=use_camera_embed,
+                )
+                for c in ch_per_scale
+            ]
+        )
+        self.lambda_flow = lambda_flow
+        self.num_integration_steps = max(int(num_integration_steps), 1)
+        self.detach_inputs = detach_inputs
+
+    @staticmethod
+    def _flatten_views(feat):
+        B, V, C, H, W = feat.shape
+        return feat.reshape(B * V, C, H, W)
+
+    @staticmethod
+    def _build_camera_ids(batch_size, num_cameras, device):
+        return (
+            torch.arange(num_cameras, device=device, dtype=torch.long)
+            .view(1, num_cameras)
+            .expand(batch_size, -1)
+            .reshape(-1)
+        )
+
+    def _build_context(self, feat, cam_mask):
+        visible = (~cam_mask).to(feat.dtype).view(feat.shape[0], feat.shape[1], 1, 1, 1)
+        denom = visible.sum(dim=1, keepdim=True).clamp(min=1.0)
+        context = (feat * visible).sum(dim=1, keepdim=True) / denom
+        return context.expand_as(feat)
+
+    def _build_loss_weight(self, cam_mask, camera_weights, dtype, device):
+        weight = cam_mask.to(device=device, dtype=dtype)
+        if camera_weights is not None:
+            cam_w = camera_weights.to(device=device, dtype=dtype)
+            if cam_w.shape != weight.shape:
+                raise ValueError("camera_weights shape should be [B, V]")
+            weight = weight * (1.0 + cam_w.clamp(min=0.0))
+        return weight
+
+    def _integrate(self, predictor, source, context, camera_ids):
+        state = source.clone()
+        miss_mask = source.new_ones((source.shape[0], 1, source.shape[2], source.shape[3]))
+        dt = 1.0 / float(self.num_integration_steps)
+        for step in range(self.num_integration_steps):
+            time = source.new_full((source.shape[0],), step * dt)
+            velocity = predictor(state, source, context, miss_mask, time, camera_ids)
+            state = state + velocity * dt
+        return state
+
+    def forward(
+        self,
+        feature_maps,
+        cam_mask,
+        metas=None,
+        camera_weights=None,
+        target_feature_maps=None,
+    ):
+        assert cam_mask is not None, "FeatureFlowReconstructor requires cam_mask"
+        cam_mask = cam_mask.to(dtype=torch.bool)
+        B_mask, V_mask = cam_mask.shape
+        outs = []
+
+        total_flow_loss = feature_maps[0].new_zeros(())
+
+        for i, Fm in enumerate(feature_maps):
+            B, V, C, H, W = Fm.shape
+            if B != B_mask or V != V_mask:
+                raise ValueError("cam_mask shape must match feature maps")
+
+            source = Fm.detach() if self.detach_inputs else Fm
+            target = source
+            if target_feature_maps is not None:
+                target_fm = target_feature_maps[i]
+                if target_fm.shape != Fm.shape:
+                    raise ValueError("target_feature_maps scale shape mismatch")
+                target = target_fm.detach()
+
+            miss = cam_mask.to(Fm.device)
+            if miss.any():
+                context = self._build_context(source, miss)
+                flat_source = self._flatten_views(source)
+                flat_target = self._flatten_views(target)
+                flat_context = self._flatten_views(context)
+                flat_feat = self._flatten_views(Fm)
+                miss_flat = miss.reshape(B * V)
+                camera_ids = self._build_camera_ids(B, V, Fm.device)[miss_flat]
+
+                source_miss = flat_source[miss_flat]
+                target_miss = flat_target[miss_flat]
+                context_miss = flat_context[miss_flat]
+                time = torch.rand(source_miss.shape[0], device=Fm.device, dtype=Fm.dtype)
+                x_t = torch.lerp(
+                    source_miss,
+                    target_miss,
+                    time.view(-1, 1, 1, 1),
+                )
+                miss_map = source_miss.new_ones((source_miss.shape[0], 1, H, W))
+                pred_velocity = self.predictors[i](
+                    x_t,
+                    source_miss,
+                    context_miss,
+                    miss_map,
+                    time,
+                    camera_ids,
+                )
+                target_velocity = target_miss - source_miss
+                loss_per_view = (pred_velocity - target_velocity).pow(2).flatten(1).mean(dim=1)
+
+                view_weight = self._build_loss_weight(
+                    miss,
+                    camera_weights,
+                    dtype=Fm.dtype,
+                    device=Fm.device,
+                ).reshape(B * V)[miss_flat]
+                normalizer = view_weight.sum().clamp(min=1.0)
+                total_flow_loss = total_flow_loss + (loss_per_view * view_weight).sum() / normalizer
+
+                recon_miss = self._integrate(
+                    self.predictors[i],
+                    source_miss,
+                    context_miss,
+                    camera_ids,
+                )
+                flat_feat = flat_feat.clone()
+                flat_feat[miss_flat] = recon_miss
+                F_out = flat_feat.reshape(B, V, C, H, W)
+            else:
+                F_out = Fm
+
+            outs.append(F_out)
+
+        return outs, {"loss_pv_flow": self.lambda_flow * total_flow_loss}
+
+
+class IdentityPVReconstructor(nn.Module):
+    def forward(
+        self,
+        feature_maps,
+        cam_mask,
+        metas=None,
+        camera_weights=None,
+        target_feature_maps=None,
+    ):
+        return feature_maps, {}
+
+
+def build_pv_reconstructor(cfg=None):
+    cfg = copy.deepcopy(cfg) if cfg is not None else {}
+    recon_type = cfg.pop("type", "vae")
+    default_channels = [256, 256, 256, 256]
+
+    if recon_type in ("identity", "none", None):
+        return IdentityPVReconstructor()
+
+    if recon_type == "vae":
+        defaults = dict(
+            ch_per_scale=default_channels,
+            latent_channels=64,
+            lambda_rec=0.01,
+            lambda_kl=1e-4,
+        )
+        defaults.update(cfg)
+        return PVReconVAE(**defaults)
+
+    if recon_type == "flow":
+        defaults = dict(
+            ch_per_scale=default_channels,
+            hidden_channels=128,
+            time_embed_dim=128,
+            lambda_flow=0.01,
+            num_integration_steps=4,
+            num_cameras=6,
+            use_camera_embed=True,
+            detach_inputs=True,
+        )
+        defaults.update(cfg)
+        return FeatureFlowReconstructor(**defaults)
+
+    raise ValueError(f"Unsupported pv_recon type: {recon_type}")
 
 
 # ===========================================
@@ -1321,7 +1616,7 @@ class LightDreamerRSSM(nn.Module):
 
 
 # ============================
-# 3) 主模型：接入 VAE + 自监督
+# 3) 主模型：接入视角重建 + 自监督
 # ============================
 @DETECTORS.register_module()
 class SparseDrive(BaseDetector):
@@ -1341,6 +1636,7 @@ class SparseDrive(BaseDetector):
         world_model_cfg=None,  # Dreamer 风格潜世界模型
         test_cam_missing=False,  # 测试时是否模拟相机缺失
         cam_dropout_cfg=None,
+        pv_recon_cfg=None,  # 视角特征重建配置（VAE / Flow Matching）
         temporal_completion_cfg=None,  # 时序补全配置
         planning_guided_completion_cfg=None,  # 规划引导补全配置
         frozen_modules=None,   # 冻结模块名列表，支持 "a.b.c" 点分路径
@@ -1395,17 +1691,11 @@ class SparseDrive(BaseDetector):
         # 是否在 test 阶段模拟相机缺失
         self.test_cam_missing = test_cam_missing
 
-        # VAE 视角级特征补全模块
-        # 注意 ch_per_scale 要和 neck 输出通道对齐
-        self.pv_recon = PVReconVAE(
-            ch_per_scale=[256, 256, 256, 256],
-            latent_channels=64,
-            lambda_rec=0.01,  # 降低权重：从1.0改为0.01，避免VAE损失主导训练
-            lambda_kl=1e-4,
-        )
+        # 视角级特征重建模块，默认使用 VAE；可切换到 flow matching。
+        self.pv_recon = build_pv_reconstructor(pv_recon_cfg)
 
-        # 存储 VAE loss
-        self.vae_loss_dict = None
+        # 存储重建损失
+        self.pv_recon_loss_dict = None
 
         self.ssl_weight = ssl_weight
 
@@ -1512,7 +1802,7 @@ class SparseDrive(BaseDetector):
     @auto_fp16(apply_to=("img",), out_fp32=True)
     def _extract_backbone_neck(self, img, metas=None, enable_deform=False):
         """
-        只跑 backbone + neck（可选 deformable），不做 VAE 补全、不算 depth。
+        只跑 backbone + neck（可选 deformable），不做视角重建、不算 depth。
         输入 img: [B, V, 3, H, W] 或 [B, 3, H, W]
         输出: list of [B, V, C, H, W]
         """
@@ -1547,14 +1837,14 @@ class SparseDrive(BaseDetector):
         return feats
 
     # -----------------------
-    # 推理/测试用的 extract_feat（带 VAE / depth）
+    # 推理/测试用的 extract_feat（带 pv_recon / depth）
     # -----------------------
     @auto_fp16(apply_to=("img",), out_fp32=True)
     def extract_feat(self, img, return_depth=False, metas=None, cam_mask=None):
         """
         仅在 eval/test 中使用；训练阶段 forward_train 不走这条
         """
-        self.vae_loss_dict = None  # 测试阶段不记录 VAE 损失
+        self.pv_recon_loss_dict = None  # 测试阶段不记录重建损失
 
         if self.training:
             # 训练阶段不应调用这个接口
@@ -1854,7 +2144,7 @@ class SparseDrive(BaseDetector):
             return self.forward_test(img, **data)
 
     # -----------------------
-    # 训练前向：带 SSL + VAE + 时序补全 + 规划导向加权
+    # 训练前向：带 SSL + 视角重建 + 时序补全 + 规划导向加权
     # -----------------------
     def forward_train(self, img, **data):
         # img: [B, V, 3, H, W]
@@ -1904,15 +2194,15 @@ class SparseDrive(BaseDetector):
         ego_state = self._extract_ego_state(data, img.device)
         importance_weights = self.planning_weighting(cam_mask, ego_state)  # [B, V]
 
-        # 8) VAE 视角补全（应用规划导向加权）
-        feature_maps, vae_loss = self.pv_recon(
+        # 8) 视角特征重建（应用规划导向加权）
+        feature_maps, pv_recon_loss = self.pv_recon(
             feats_temporal,
             cam_mask,
             metas=data,
             camera_weights=importance_weights,
             target_feature_maps=feats_full_base,
         )
-        self.vae_loss_dict = vae_loss  # 用于后面合并 loss
+        self.pv_recon_loss_dict = pv_recon_loss  # 用于后面合并 loss
 
         # ===== 新增：规划引导补全 =====
         # 9) 轨迹来源由 trajectory_source 控制：none / gt / pred（pred 使用 stop-grad）
@@ -1975,9 +2265,9 @@ class SparseDrive(BaseDetector):
                 depths, data["gt_depth"]
             )
 
-        # 合并 VAE 损失
-        if self.vae_loss_dict is not None:
-            output.update(self.vae_loss_dict)
+        # 合并视角重建损失
+        if self.pv_recon_loss_dict is not None:
+            output.update(self.pv_recon_loss_dict)
 
         if world_loss_dict is not None:
             output.update(world_loss_dict)
@@ -2026,7 +2316,7 @@ class SparseDrive(BaseDetector):
                 feature_maps_list, cam_mask, metas=data
             )
 
-        # ===== 新增：测试时的 VAE + 规划引导补全 =====
+        # ===== 新增：测试时的视角重建 + 规划引导补全 =====
         if cam_mask is not None and cam_mask.any():
             feature_maps_list = list(feature_maps) if isinstance(feature_maps, tuple) else feature_maps
             ego_state = self._extract_ego_state(data, img.device)

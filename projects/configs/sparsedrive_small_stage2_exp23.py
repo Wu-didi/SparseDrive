@@ -7,7 +7,7 @@ plugin = True
 plugin_dir = "projects/mmdet3d_plugin/"
 dist_params = dict(backend="nccl")
 log_level = "INFO"
-work_dir = "./work_dirs/sparsedrive_small_stage2_exp22"
+work_dir = "./work_dirs/sparsedrive_small_stage2_exp23"
 
 total_batch_size =2
 num_gpus = 1

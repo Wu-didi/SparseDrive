@@ -1,0 +1,144 @@
+# Work_dirs 实验总览
+
+更新时间：2026-03-16
+
+数据来源：
+
+- `work_dirs/*/metrics_summary.json`
+- `work_dirs/*/e2e_metrics.json`
+- `work_dirs/*/*.py` 配置快照
+
+整理原则：
+
+- 有 `e2e_metrics.json` 的实验归入“完整 e2e 实验”
+- 只有 `metrics_summary.json` 的实验归入“历史 tracking 实验”
+- 没有完整评估文件的目录不纳入横向比较
+
+## 论文主表
+
+说明：
+
+- `train commit` 来自对应实验目录下最新 `*.log.json` 的环境记录；早期实验日志未保留 commit 信息时记为 `unknown`
+- `branch` 表示当前仓库中仍保留、与该实验最接近的分支名；精确训练代码以 `train commit` 为准
+- `Tracking` 列格式为 `AMOTA / AMOTP / Recall / MOTA / MOTP`
+- `Motion` 列格式为 `car EPA / ADE / FDE / MR ; ped EPA / ADE / FDE / MR`
+- `Planning` 列格式为 `obj_col / obj_box_col / L2`
+
+| 实验 | 类型 | 配置快照 | train commit | branch | 初始化权重 | 改动内容 | Detection | Tracking | Map | Motion | Planning | 备注 |
+|------|------|----------|--------------|--------|------------|----------|-----------|----------|-----|--------|----------|------|
+| stage1_before | stage1 | `sparsedrive_small_stage1.py` | `unknown` | `未保留` | `unknown` | 早期 stage1 感知预训练结果 | `-` | `0.0014 / 1.7761 / 0.4125 / 0.0070 / 0.8879` | `-` | `-` | `-` | 与 stage2 e2e 不可直接比较 |
+| exp8 | tracking-only | `sparsedrive_small_stage2.py` | `unknown` | `未保留` | `unknown` | 早期 stage2 基线 | `-` | `0.3866 / 1.2526 / 0.4831 / 0.3539 / 0.6268` | `-` | `-` | `-` | 早期较强 tracking 基线 |
+| exp9 | tracking-only | `sparsedrive_small_stage2.py` | `unknown` | `未保留` | `unknown` | 早期 stage2 变体 | `-` | `0.3289 / 1.2932 / 0.4537 / 0.3114 / 0.6733` | `-` | `-` | `-` | 相比 exp8 退化 |
+| exp13 | tracking-only | `sparsedrive_small_stage2.py` | `unknown` | `未保留` | `ckpt/sparsedrive_stage2.pth` | 高学习率尝试，`lr=3.5e-5` | `-` | `0.1865 / 1.5158 / 0.2837 / 0.1933 / 0.8917` | `-` | `-` | `-` | 失败实验 |
+| exp14 | tracking-only | `sparsedrive_small_stage2.py` | `unknown` | `未保留` | `ckpt/sparsedrive_stage2.pth` | 高学习率重试，`lr=3.5e-5` | `-` | `0.3749 / 1.2624 / 0.5087 / 0.3368 / 0.6538` | `-` | `-` | `-` | 恢复正常 |
+| exp15 | tracking-only | `sparsedrive_small_stage2.py` | `unknown` | `未保留` | `ckpt/sparsedrive_stage2.pth` | exp14 同族稳定复跑，`lr=3.5e-5` | `-` | `0.3702 / 1.2695 / 0.4812 / 0.3406 / 0.6536` | `-` | `-` | `-` | 与 exp14 接近 |
+| exp16 | tracking-only | `sparsedrive_small_stage2.py` | `unknown` | `未保留` | `exp15/iter_210960.pth` | 在 exp15 上继续训练，`lr=3.5e-5` | `-` | `0.3730 / 1.2587 / 0.4913 / 0.3418 / 0.6408` | `-` | `-` | `-` | 小幅提升 |
+| exp17 | tracking-only | `sparsedrive_small_stage2.py` | `unknown` | `未保留` | `ckpt/sparsedrive_stage2.pth` | 学习率降到 `1.5e-5` | `-` | `0.3715 / 1.2616 / 0.4850 / 0.3370 / 0.6373` | `-` | `-` | `-` | 进入稳定区间 |
+| exp18 | tracking-only | `sparsedrive_small_stage2.py` | `unknown` | `未保留` | `ckpt/sparsedrive_stage2.pth` | 启用规划引导补全相关配置 | `-` | `0.3696 / 1.2691 / 0.4915 / 0.3380 / 0.6517` | `-` | `-` | `-` | exp19 前置版本 |
+| exp19 | e2e | `sparsedrive_small_stage2.py` | `a2ed2cb` | `exp19` | `ckpt/sparsedrive_stage2.pth` | `trajectory_source='none'` | `0.4137 / 0.5244` | `0.3905 / 1.2494 / 0.4907 / 0.3590 / 0.6287` | `0.5496` | `0.5018 / 0.6265 / 0.9889 / 0.1278 ; 0.4111 / 0.7198 / 1.0557 / 0.1473` | `0.6702% / 0.1769% / 0.6448` | tracking 最强 |
+| exp20 | e2e | `sparsedrive_small_stage2.py` | `2a5dbeb` | `exp20` | `ckpt/sparsedrive_stage2.pth` | `trajectory_source='pred'` | `0.4131 / 0.5258` | `0.3792 / 1.2490 / 0.5319 / 0.3479 / 0.6475` | `0.5515` | `0.4977 / 0.6359 / 1.0053 / 0.1305 ; 0.4109 / 0.7195 / 1.0558 / 0.1487` | `0.6702% / 0.1031% / 0.6429` | 规划基线 |
+| exp21 | e2e | `sparsedrive_small_stage2.py` | `049f490` | `exp21` | `ckpt/sparsedrive_stage2.pth` | `trajectory_source='gt'` | `0.4095 / 0.5229` | `0.3710 / 1.2487 / 0.5262 / 0.3440 / 0.6473` | `0.5483` | `0.4917 / 0.6427 / 0.9919 / 0.1322 ; 0.4005 / 0.7521 / 1.0994 / 0.1538` | `0.6702% / 0.0922% / 0.7314` | GT 引导导致规划退化 |
+| exp22-0 | e2e | `sparsedrive_small_stage2.py` | `003bd6a` | `exp22` 家族 | `ckpt/sparsedrive_stage2.pth` | 冻结大部分模块，仅训 `motion_plan_head`，但误加载初始权重 | `0.4145 / 0.5246` | `0.3699 / 1.2543 / 0.4999 / 0.3436 / 0.6250` | `0.5656` | `0.4856 / 0.6197 / 0.9785 / 0.1400 ; 0.4115 / 0.7031 / 1.0303 / 0.1393` | `0.6702% / 0.2458% / 0.7900` | 无效对照 |
+| exp22 | e2e | `sparsedrive_small_stage2.py` | `003bd6a` | `exp22` | `exp20/iter_281300.pth` | 冻结大部分模块，仅训 `motion_plan_head`，`lr=1.5e-5` | `0.4126 / 0.5269` | `0.3796 / 1.2495 / 0.4958 / 0.3470 / 0.6213` | `0.5515` | `0.4961 / 0.6435 / 1.0283 / 0.1327 ; 0.4149 / 0.7070 / 1.0328 / 0.1428` | `0.6702% / 0.1118% / 0.6311` | 当前最优 L2 与 NDS |
+| exp23 | e2e | `sparsedrive_small_stage2_exp23.py` | `a4ee13a` | `exp23` | `exp22/latest.pth` | L2-focused 微调，`lr=5e-6`，`motion loss=0`，`plan cls/status=0` | `0.4114 / 0.5249` | `0.3772 / 1.2523 / 0.4915 / 0.3418 / 0.6162` | `0.5515` | `0.4944 / 0.6485 / 1.0382 / 0.1349 ; 0.4156 / 0.7061 / 1.0318 / 0.1404` | `0.6702% / 0.1096% / 0.6657` | 过度压缩 loss，L2 回升 |
+| exp24 | e2e | `sparsedrive_small_stage2_exp24.py` | `a4ee13a` | `exp24` | `exp23/iter_210975.pth` | 稳定性修正，`lr=5e-6`，`motion loss=0`，`plan cls=0.2`，`status=0` | `0.4121 / 0.5262` | `0.3772 / 1.2584 / 0.5325 / 0.3433 / 0.6399` | `0.5516` | `0.4946 / 0.6516 / 1.0472 / 0.1353 ; 0.4155 / 0.7102 / 1.0409 / 0.1426` | `0.6702% / 0.2089% / 0.7116` | 碰撞和 L2 同时恶化 |
+| exp25 | e2e | `sparsedrive_small_stage2_exp25.py` | `7d80546` | `exp25` | `exp22/iter_140650.pth` | 稳健版重启，`lr=3e-6`，`motion loss=0.1`，`plan status=0.2` | `0.4133 / 0.5264` | `0.3808 / 1.2508 / 0.5028 / 0.3493 / 0.6299` | `0.5514` | `0.4986 / 0.6466 / 1.0385 / 0.1305 ; 0.4158 / 0.7079 / 1.0340 / 0.1449` | `0.6702% / 0.1042% / 0.6464` | 次优平衡点 |
+| exp26 | e2e | `sparsedrive_small_stage2_exp26.py` | `7d80546` | `exp26` | `ckpt/sparsedrive_stage2.pth` | flow 版 `pv_recon`，`pv_recon_type='flow'`，`trajectory_source='pred'` | `0.4123 / 0.5258` | `0.3810 / 1.2493 / 0.4842 / 0.3461 / 0.6212` | `0.5511` | `0.5009 / 0.6235 / 0.9929 / 0.1287 ; 0.4114 / 0.7258 / 1.0655 / 0.1449` | `0.6702% / 0.1552% / 0.6603` | 主表记最终 ckpt；家族内最佳 planning 是 `iter_70325, L2=0.6329` |
+| 官方权重无mask | official | `N/A` | `N/A` | `官方` | `官方 checkpoint` | 标准评估，无相机缺失 | `-` | `0.3706 / 1.2550 / 0.5014 / 0.3486 / 0.6270` | `-` | `-` | `-` | 官方参考 |
+| 官方权重mask后 | official | `N/A` | `N/A` | `官方` | `官方 checkpoint` | mask 鲁棒性评估 | `-` | `0.3543 / 1.2833 / 0.5075 / 0.3298 / 0.6545` | `-` | `-` | `-` | 相机缺失降低 tracking |
+
+## 结论摘要
+
+- 当前 `work_dirs` 中规划 `L2` 最好的有效实验是 `exp22`，`L2 = 0.6311`
+- 当前 `work_dirs` 中 `NDS` 最好的有效实验也是 `exp22`，`NDS = 0.5269`
+- 当前 `work_dirs` 中 `AMOTA` 最好的完整 e2e 实验是 `exp19`，`AMOTA = 0.3905`
+- `exp22-0` 的 `mAP` 虽然最高，但这是一次误加载权重的无效对照，不能作为“基于 exp20 微调”的有效结论
+- 从当前结果看，`exp22` 仍是最均衡的一次规划微调；`exp25` 是次优的稳健版本
+- `exp26` 证明 flow 版 `pv_recon` 训练是可行的；若看最终 checkpoint，tracking 和 motion 指标较强，但若看整个实验过程，最佳 planning checkpoint 实际是第一次评测 `iter_70325`
+
+## 一、完整 E2E 实验
+
+这些目录包含 `e2e_metrics.json`，可以同时比较 detection、tracking、motion、planning。
+
+| 实验 | 权重来源 | 主要设置 | 最新 checkpoint | mAP | NDS | AMOTA | car EPA | ped EPA | obj_box_col | L2 | 备注 |
+|------|----------|----------|-----------------|-----|-----|-------|---------|---------|-------------|----|------|
+| exp19 | `ckpt/sparsedrive_stage2.pth` | `trajectory_source='none'` | `iter_281300` | 0.4137 | 0.5244 | 0.3905 | 0.5018 | 0.4111 | 0.177% | 0.6448 | 完整训练，tracking 最强 |
+| exp20 | `ckpt/sparsedrive_stage2.pth` | `trajectory_source='pred'` | `iter_281300` | 0.4131 | 0.5258 | 0.3792 | 0.4977 | 0.4109 | 0.103% | 0.6429 | 规划基线，后续微调起点 |
+| exp21 | `ckpt/sparsedrive_stage2.pth` | `trajectory_source='gt'` | `iter_140650` | 0.4095 | 0.5229 | 0.3710 | 0.4917 | 0.4005 | 0.092% | 0.7314 | 轨迹引导改为 GT，规划退化明显 |
+| exp22-0 | `ckpt/sparsedrive_stage2.pth` | 冻结大部分模块，仅训 `motion_plan_head` | `iter_70325` | 0.4145 | 0.5246 | 0.3699 | 0.4856 | 0.4115 | 0.246% | 0.7900 | 误加载权重，无效对照 |
+| exp22 | `exp20/iter_281300.pth` | 冻结大部分模块，仅训 `motion_plan_head`，`lr=1.5e-5` | `iter_140650` | 0.4126 | 0.5269 | 0.3796 | 0.4961 | 0.4149 | 0.112% | 0.6311 | 当前最优 L2 和 NDS |
+| exp23 | `exp22/latest.pth` | 延续冻结微调，`lr=5e-6` | `iter_281300` | 0.4114 | 0.5249 | 0.3772 | 0.4944 | 0.4156 | 0.110% | 0.6657 | 继续训练后 L2 回升 |
+| exp24 | `exp23/iter_210975.pth` | 延续冻结微调，`lr=5e-6` | `iter_140650` | 0.4121 | 0.5262 | 0.3772 | 0.4946 | 0.4155 | 0.209% | 0.7116 | 规划与碰撞同时退化 |
+| exp25 | `exp22/iter_140650.pth` | 从 exp22 中期重启，`lr=3e-6` | `iter_281300` | 0.4133 | 0.5264 | 0.3808 | 0.4986 | 0.4158 | 0.104% | 0.6464 | 次优平衡点，tracking 稳 |
+| exp26 | `ckpt/sparsedrive_stage2.pth` | `pv_recon_type='flow'`，`trajectory_source='pred'` | `iter_281300` | 0.4123 | 0.5258 | 0.3810 | 0.5009 | 0.4114 | 0.155% | 0.6603 | flow 补全版本，tracking/motion 强于 exp25，planning 一般 |
+
+### 关键观察
+
+- `exp19 -> exp20 -> exp21` 主要是在比较 `planning_guided_completion` 中的 `trajectory_source`
+- 从结果看，`pred` 比 `gt` 更稳，`gt` 明显拉高了 `L2`
+- `exp22` 开始引入冻结微调，目标是基于 `exp20` 压低规划误差
+- `exp22-0` 因为仍从 `ckpt/sparsedrive_stage2.pth` 启动，所以虽然目录名是 `exp22-0`，但不能代表“基于 exp20 微调”的效果
+- `exp22` 修正初始化后，`L2` 从 `0.6429` 降到 `0.6311`，说明这条微调路线是有效的
+- `exp23` 和 `exp24` 继续沿这条路线训练，整体没有超过 `exp22`
+- `exp25` 选择从 `exp22` 的中期 checkpoint 重启，并降低 `lr` 到 `3e-6`，结果比 `exp23/24` 稳，但仍略逊于 `exp22`
+- `exp26` 是另一条实验线，不属于 `exp22-25` 的冻结微调家族；它通过 `flow` 版 `pv_recon` 保住了较强的 tracking/motion
+- `exp26` 如果只看最终 checkpoint，规划 `L2=0.6603` 不如 `exp22` 和 `exp25`
+- 但如果看整个 `exp26` 家族，第一次评测 `iter_70325` 的 `L2=0.6329` 实际已经非常接近 `exp22`
+
+### 排名参考
+
+按 `L2` 从优到劣排序：
+
+1. `exp22`：0.6311
+2. `exp20`：0.6429
+3. `exp19`：0.6448
+4. `exp25`：0.6464
+5. `exp26`：0.6603
+6. `exp23`：0.6657
+7. `exp24`：0.7116
+8. `exp21`：0.7314
+9. `exp22-0`：0.7900
+
+## 二、历史 Tracking 实验
+
+这些目录只有 `metrics_summary.json`，可用于 tracking 历史对比，但不适合和完整 e2e 实验直接比较 motion/planning。
+
+| 实验 | 权重来源 | 可确认信息 | AMOTA | AMOTP | Recall | MOTA | MOTP | 备注 |
+|------|----------|------------|-------|-------|--------|------|------|------|
+| exp8 | 未单独整理 | 仅保留 tracking 结果 | 0.3866 | 1.2526 | 0.4831 | 0.3539 | 0.6268 | 早期较强 tracking 基线 |
+| exp9 | 未单独整理 | 仅保留 tracking 结果 | 0.3289 | 1.2932 | 0.4537 | 0.3114 | 0.6733 | 相比 exp8 明显退化 |
+| exp13 | `ckpt/sparsedrive_stage2.pth` | `lr=3.5e-5` | 0.1865 | 1.5158 | 0.2837 | 0.1933 | 0.8917 | 明显异常，建议视为失败实验 |
+| exp14 | `ckpt/sparsedrive_stage2.pth` | `lr=3.5e-5` | 0.3749 | 1.2624 | 0.5087 | 0.3368 | 0.6538 | 恢复正常 |
+| exp15 | `ckpt/sparsedrive_stage2.pth` | `lr=3.5e-5` | 0.3702 | 1.2695 | 0.4812 | 0.3406 | 0.6536 | 与 exp14 接近 |
+| exp16 | `exp15/iter_210960.pth` | `lr=3.5e-5` | 0.3730 | 1.2587 | 0.4913 | 0.3418 | 0.6408 | 在 exp15 基础上小幅提升 |
+| exp17 | `ckpt/sparsedrive_stage2.pth` | `lr=1.5e-5` | 0.3715 | 1.2616 | 0.4850 | 0.3370 | 0.6373 | 进入较稳定区间 |
+| exp18 | `ckpt/sparsedrive_stage2.pth` | 启用规划引导补全相关配置 | 0.3696 | 1.2691 | 0.4915 | 0.3380 | 0.6517 | 为 exp19 之前版本 |
+| 官方权重无mask | 官方 checkpoint | 无相机缺失评估 | 0.3706 | 1.2550 | 0.5014 | 0.3486 | - | 官方参考 |
+| 官方权重mask后 | 官方 checkpoint | 有相机缺失评估 | 0.3543 | 1.2833 | 0.5075 | 0.3298 | - | 相机缺失会拉低 tracking |
+
+## 三、非同口径结果与未纳入比较的目录
+
+以下目录不放进上面的主表，原因可能是任务口径不同、缺少完整评估文件，或者本身不是实验输出目录：
+
+- `ckpt/`
+- `docs/`
+- `mystart_train_smoke/`
+- `projects/`
+- `quickeval_test/`
+- `resources/`
+- `scripts/`
+- `sparsedrive_small_stage1/`
+- `sparsedrive_small_stage1_before/`：`stage1` 配置，tracking 指标约为 `AMOTA=0.0014`、`MOTA=0.0070`，与 `stage2` e2e 实验不具可比性
+- `sparsedrive_small_stage2_before/`
+- `stability_check_local/`
+- `tools/`
+- `work_dirs/`
+
+## 四、建议的命名和归档规则
+
+- 将 `exp22-0` 明确标注为“误加载权重，无效实验”
+- 以后新实验目录建议同时在文件名和 `work_dir` 中保持一致，避免出现目录名和实际初始化来源不一致
+- 每次实验至少保留配置快照
+- 每次实验至少保留 `metrics_summary.json`
+- 每次实验至少保留 `e2e_metrics.json`
+- 每次实验至少补一句实验目的说明

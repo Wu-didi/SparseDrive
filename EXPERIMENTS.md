@@ -1,5 +1,153 @@
 # SparseDrive 实验记录
 
+完整的 `work_dirs` 实验汇总见 [WORKDIR_EXPERIMENTS.md](/home/wudi/code/mySparseDrive/SparseDrive/WORKDIR_EXPERIMENTS.md)。
+
+## 2026-03 规划/轨迹分支冻结微调记录
+
+### 实验目标
+
+基于 `exp20` 的权重继续微调，仅更新 `motion_plan_head`，冻结感知和建图相关模块，验证是否可以在保持整体指标基本稳定的前提下进一步降低规划 `L2` 误差。
+
+### 实验配置
+
+- 配置文件：`projects/configs/sparsedrive_small_stage2.py`
+- 冻结策略：冻结 `img_backbone`、`img_neck`、`depth_branch`、`pv_recon`、`world_model`、`temporal_completion`、`planning_weighting`、`planning_guided_completion`、`planning_feedback_loss`、`head.det_head`、`head.map_head`
+- 训练分支：`motion_plan_head`
+- 注意：当前 `motion_plan_head` 仍同时优化 `motion loss` 和 `planning loss`，并不是纯 `planning-only` 微调
+
+### 实验目录
+
+- `exp20` 基线：`work_dirs/sparsedrive_small_stage2_exp20/`
+- `exp22-0`：误加载权重的无效实验，目录为 `work_dirs/sparsedrive_small_stage2_exp22-0/`
+- `exp22`：修正后从 `exp20` 最终权重启动的有效实验，目录为 `work_dirs/sparsedrive_small_stage2_exp22/`
+- `exp23`：从 `exp22/latest.pth` 继续做更强的 L2-focused 微调
+- `exp24`：从 `exp23/iter_210975.pth` 继续做稳定性修正
+- `exp25`：这次实验，从 `exp22/iter_140650.pth` 重启，走更稳的低学习率方案
+
+### 关键结果对比
+
+| 指标 | exp20 基线 | exp22-0（误加载） | exp22（修正后，iter_140650） |
+|------|------------|-------------------|------------------------------|
+| mAP | 0.4131 | 0.4145 | 0.4126 |
+| NDS | 0.5258 | 0.5246 | 0.5269 |
+| AMOTA | 0.3792 | 0.3699 | 0.3796 |
+| car EPA | 0.4977 | 0.4856 | 0.4961 |
+| pedestrian EPA | 0.4109 | 0.4115 | 0.4149 |
+| car minADE | 0.6359 | 0.6197 | 0.6435 |
+| car minFDE | 1.0053 | 0.9785 | 1.0283 |
+| pedestrian minADE | 0.7195 | 0.7031 | 0.7070 |
+| pedestrian minFDE | 1.0558 | 1.0303 | 1.0328 |
+| obj_box_col | 0.103% | 0.246% | 0.112% |
+| L2 | 0.6429 | 0.7900 | 0.6311 |
+
+### 结果分析
+
+- `exp22-0` 不能用于评估“基于 `exp20` 微调是否有效”，因为它实际从 `ckpt/sparsedrive_stage2.pth` 启动，而不是从 `exp20` 启动
+- `exp22-0` 的主要问题是规划明显退化，`L2` 从 `0.6429` 升到 `0.7900`，同时 `obj_box_col` 也显著升高
+- `exp22` 修正为从 `work_dirs/sparsedrive_small_stage2_exp20/iter_281300.pth` 启动后，`L2` 降到 `0.6311`，优于 `exp20`
+- 修正后检测和跟踪基本稳定，`NDS` 和 `AMOTA` 没有明显恶化
+- 修正后 motion 指标有小幅波动，说明当前微调更偏向改善 planning，不一定会同时优化所有 motion 指标
+
+### 后续微调结果表格
+
+下表把 `exp22` 之后的三次微调一起整理出来，便于横向看“这次实验”在整个冻结微调序列中的位置。
+
+| 实验 | 初始化权重 | 主要设置 | 最新 checkpoint | mAP | NDS | AMOTA | car EPA | ped EPA | obj_box_col | L2 | 备注 |
+|------|------------|----------|-----------------|-----|-----|-------|---------|---------|-------------|----|------|
+| exp22 | `exp20/iter_281300.pth` | 冻结大部分模块，仅训 `motion_plan_head`，`lr=1.5e-5` | `iter_140650` | 0.4126 | 0.5269 | 0.3796 | 0.4961 | 0.4149 | 0.112% | 0.6311 | 当前最优 L2 和 NDS |
+| exp23 | `exp22/latest.pth` | `lr=5e-6`，`motion loss=0`，`plan cls/status=0` | `iter_281300` | 0.4114 | 0.5249 | 0.3772 | 0.4944 | 0.4156 | 0.110% | 0.6657 | 过度压缩 loss，L2 回升 |
+| exp24 | `exp23/iter_210975.pth` | `lr=5e-6`，`motion loss=0`，`plan cls=0.2`，`status=0` | `iter_140650` | 0.4121 | 0.5262 | 0.3772 | 0.4946 | 0.4155 | 0.209% | 0.7116 | 规划和碰撞同时恶化 |
+| exp25 | `exp22/iter_140650.pth` | `lr=3e-6`，`motion loss=0.1`，`plan status=0.2` | `iter_281300` | 0.4133 | 0.5264 | 0.3808 | 0.4986 | 0.4158 | 0.104% | 0.6464 | 这次实验，次优平衡点 |
+
+### 后续微调分析
+
+- `exp23` 说明把 `motion loss` 和 `plan cls/status` 一次性压到接近 0 会让训练目标过窄，`L2` 反而从 `0.6311` 回升到 `0.6657`
+- `exp24` 虽然尝试恢复部分 `plan cls`，但 `obj_box_col` 升到 `0.209%`，说明稳定性没有真正修回来
+- `exp25` 改为从 `exp22` 中期 checkpoint 重启，并把学习率降到 `3e-6`，结果把 `AMOTA` 拉回到 `0.3808`，`obj_box_col` 压到 `0.104%`
+- 就这次实验本身而言，`exp25` 比 `exp23/24` 明显更稳，但 `L2 = 0.6464` 仍未超过 `exp22` 的 `0.6311`
+- 如果目标是追求最优 `L2`，当前仍应以 `exp22` 为主；如果目标是兼顾 tracking 和碰撞率，`exp25` 是目前更均衡的后续版本
+
+### 排查结论
+
+- 这次性能判断偏差的根因是 `load_from` 配置错误
+- 错误实验的结论应视为无效，只能作为“错误初始化会导致规划退化”的反例
+- 当前有效配置：`work_dir = "./work_dirs/sparsedrive_small_stage2_exp22"`
+- 当前有效配置：`load_from = "work_dirs/sparsedrive_small_stage2_exp20/iter_281300.pth"`
+
+### 后续建议
+
+- 优先将 `exp22` 继续训练到最终 checkpoint，再与 `exp20` 做完整对比
+- 如果更关注整体均衡性，可以从 `exp25` 继续小步微调，而不是从 `exp24` 延续
+- 如果目标是进一步压低 `L2`，建议补一个真正的 `planning-only` 消融实验，将 `motion_loss_cls` 和 `motion_loss_reg` 置零
+- 后续实验记录统一写入本文件，避免只看 `work_dir` 名字导致混淆
+
+## 2026-03 exp26: flow 版 PVRecon 实验
+
+### 实验目标
+
+验证把 `pv_recon` 从原有 VAE 路线切换为 `flow` 路线后，整体 e2e 指标是否还能保持稳定，以及它对 tracking、motion 和 planning 的影响。
+
+### 实验配置
+
+- 配置文件：`projects/configs/sparsedrive_small_stage2_exp26.py`
+- 初始化权重：`ckpt/sparsedrive_stage2.pth`
+- 关键改动：`pv_recon_type='flow'`
+- 轨迹来源：`trajectory_source='pred'`
+- 学习率：默认主线设置，未采用 `exp22-25` 的冻结微调方案
+- 这一实验不属于 `exp22-25` 的“冻结 `motion_plan_head` 微调线”，而是一条独立的结构改动实验
+
+### 全部评测结果
+
+`exp26` 一共做了 4 次完整评测，分别对应：
+
+- `iter_70325`
+- `iter_140650`
+- `iter_210975`
+- `iter_281300`
+
+结果来源：
+
+- 中间 3 次评测来自 `work_dirs/sparsedrive_small_stage2_exp26/20260313_205923.log`
+- 最终一次评测同时也写入了 `work_dirs/sparsedrive_small_stage2_exp26/e2e_metrics.json`
+
+#### checkpoint 级结果总表
+
+| checkpoint | mAP | NDS | AMOTA | mAP_normal | car EPA | ped EPA | obj_box_col | L2 | 备注 |
+|------------|-----|-----|-------|------------|---------|---------|-------------|----|------|
+| iter_70325 | 0.4007 | 0.5154 | 0.3674 | 0.5400 | 0.4815 | 0.4031 | 0.166% | **0.6329** | 第一次评测，planning 最好 |
+| iter_140650 | 0.4050 | 0.5177 | 0.3666 | 0.5476 | 0.4903 | 0.4012 | 0.084% | 0.6655 | 碰撞更低，但 L2 回升 |
+| iter_210975 | 0.4077 | **0.5262** | 0.3767 | 0.5442 | 0.4953 | 0.4005 | **0.075%** | 0.6467 | 最均衡 checkpoint |
+| iter_281300 | **0.4123** | 0.5258 | **0.3810** | **0.5511** | **0.5009** | **0.4114** | 0.155% | 0.6603 | 最终 checkpoint，tracking/motion 最强 |
+
+#### 详细指标表
+
+| checkpoint | car ADE / FDE / MR | pedestrian ADE / FDE / MR | AMOTP / Recall / MOTA / MOTP |
+|------------|---------------------|----------------------------|-------------------------------|
+| iter_70325 | 0.6447 / 1.0073 / 0.1414 | 0.7302 / 1.0663 / 0.1492 | 1.2655 / 0.4679 / 0.3397 / 0.6295 |
+| iter_140650 | 0.6360 / 0.9954 / 0.1377 | 0.7594 / 1.1198 / 0.1591 | 1.2503 / 0.5343 / 0.3331 / 0.6656 |
+| iter_210975 | 0.6323 / 1.0008 / 0.1283 | 0.7405 / 1.0835 / 0.1525 | 1.2455 / 0.4831 / 0.3448 / 0.6293 |
+| iter_281300 | 0.6235 / 0.9929 / 0.1287 | 0.7258 / 1.0655 / 0.1449 | 1.2493 / 0.4842 / 0.3461 / 0.6212 |
+
+### 结果分析
+
+- `exp26` 的 4 次评测不是单调变好，而是出现了明显的任务 trade-off
+- 如果只看 planning，第一次 `iter_70325` 最好，`L2 = 0.6329`，已经非常接近 `exp22 = 0.6311`
+- 如果看碰撞安全性，`iter_210975` 最好，`obj_box_col = 0.075%`
+- 如果看 detection / tracking / motion，最终 `iter_281300` 最强，`mAP = 0.4123`、`AMOTA = 0.3810`、`car EPA = 0.5009`
+- 也就是说，`exp26` 越往后训练，感知、跟踪和运动预测在持续提升，但 planning `L2` 没有同步受益，反而从 `0.6329` 回升到 `0.6603`
+- 这说明 `flow` 版 `pv_recon` 对感知和时序建模是有效的，但当前训练目标还没有把这种收益稳定传递到规划头
+
+### 当前结论
+
+- 如果目标是追求 **最佳 planning L2**，`exp26` 应该优先取 `iter_70325`，而不是最终 `iter_281300`
+- 如果目标是追求 **最均衡 checkpoint**，`iter_210975` 更合适：`NDS` 高、`obj_box_col` 最低、`L2` 也优于最终 checkpoint
+- 如果目标是追求 **最强 tracking / motion**，最终 `iter_281300` 仍然最合适
+- 更合理的下一步不是只保留一个“最终结果”，而是同时记住：
+  - `iter_70325`：最佳 planning
+  - `iter_210975`：最佳均衡
+  - `iter_281300`：最佳 tracking / motion
+- 后续如果继续做 `exp26` 族实验，更建议在 `iter_70325` 或 `iter_210975` 基础上接规划微调，而不是默认从最终 checkpoint 开始
+
 ## V2 版本实验（局部注意力优化）
 
 ### 实验目标
