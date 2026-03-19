@@ -6,6 +6,7 @@ _base_ = './sparsedrive_small_stage2_exp26.py'
 work_dir = './work_dirs/sparsedrive_small_stage2_exp27'
 
 model = dict(
+    test_cam_missing=True,
     frozen_modules=[
         'img_backbone',
         'img_neck',

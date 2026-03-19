@@ -4,10 +4,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${ROOT_DIR}"
 
-CONFIG="${CONFIG:-projects/configs/sparsedrive_small_stage2.py}"
-CHECKPOINT="${CHECKPOINT:-work_dirs/sparsedrive_small_stage2/iter_421950.pth}"
+CONFIG="${CONFIG:-projects/configs/sparsedrive_small_stage2_exp27.py}"
+CHECKPOINT="${CHECKPOINT:-work_dirs/sparsedrive_small_stage2_exp27/latest.pth}"
 EVAL_METRIC="${EVAL_METRIC:-bbox}"
-WORK_DIR="${WORK_DIR:-work_dirs/$(basename "${CONFIG%.py}")}"
+WORK_DIR="${WORK_DIR:-./exp27_mask_eval}"
 
 # 优先保证在指定 conda 环境下运行
 if [[ "${CONDA_DEFAULT_ENV:-}" != "sparsedrive" ]]; then
@@ -36,6 +36,7 @@ python tools/test.py \
   "${CHECKPOINT}" \
   --eval "${EVAL_METRIC}" \
   --deterministic \
+  --cfg-options work_dir="${WORK_DIR}" data.workers_per_gpu=0 \
   "$@"
 
 if [[ -f "${WORK_DIR}/e2e_metrics.json" ]]; then

@@ -1,12 +1,13 @@
 # Work_dirs 实验总览
 
-更新时间：2026-03-16
+更新时间：2026-03-19
 
 数据来源：
 
 - `work_dirs/*/metrics_summary.json`
 - `work_dirs/*/e2e_metrics.json`
 - `work_dirs/*/*.py` 配置快照
+- `./exp27_mask_eval/e2e_metrics.json`（补充记录 `exp27` 的 masked eval）
 
 整理原则：
 
@@ -44,17 +45,20 @@
 | exp24 | e2e | `sparsedrive_small_stage2_exp24.py` | `a4ee13a` | `exp24` | `exp23/iter_210975.pth` | 稳定性修正，`lr=5e-6`，`motion loss=0`，`plan cls=0.2`，`status=0` | `0.4121 / 0.5262` | `0.3772 / 1.2584 / 0.5325 / 0.3433 / 0.6399` | `0.5516` | `0.4946 / 0.6516 / 1.0472 / 0.1353 ; 0.4155 / 0.7102 / 1.0409 / 0.1426` | `0.6702% / 0.2089% / 0.7116` | 碰撞和 L2 同时恶化 |
 | exp25 | e2e | `sparsedrive_small_stage2_exp25.py` | `7d80546` | `exp25` | `exp22/iter_140650.pth` | 稳健版重启，`lr=3e-6`，`motion loss=0.1`，`plan status=0.2` | `0.4133 / 0.5264` | `0.3808 / 1.2508 / 0.5028 / 0.3493 / 0.6299` | `0.5514` | `0.4986 / 0.6466 / 1.0385 / 0.1305 ; 0.4158 / 0.7079 / 1.0340 / 0.1449` | `0.6702% / 0.1042% / 0.6464` | 次优平衡点 |
 | exp26 | e2e | `sparsedrive_small_stage2_exp26.py` | `7d80546` | `exp26` | `ckpt/sparsedrive_stage2.pth` | flow 版 `pv_recon`，`pv_recon_type='flow'`，`trajectory_source='pred'` | `0.4123 / 0.5258` | `0.3810 / 1.2493 / 0.4842 / 0.3461 / 0.6212` | `0.5511` | `0.5009 / 0.6235 / 0.9929 / 0.1287 ; 0.4114 / 0.7258 / 1.0655 / 0.1449` | `0.6702% / 0.1552% / 0.6603` | 主表记最终 ckpt；家族内最佳 planning 是 `iter_70325, L2=0.6329` |
+| exp27 | e2e | `sparsedrive_small_stage2_exp27.py` | `e975c8d` | `exp27` | `exp26/iter_70325.pth` | 从 `exp26` 最佳 planning 点继续，冻结感知/检测/建图与 `pv_recon`，`lr=3e-6` | `0.4015 / 0.5157` | `0.3656 / 1.2651 / 0.4793 / 0.3341 / 0.6215` | `0.5401` | `0.4869 / 0.6319 / 0.9821 / 0.1320 ; 0.4042 / 0.7253 / 1.0588 / 0.1449` | `0.6702% / 0.1129% / 0.6268` | 主表记标准 eval 最终 ckpt；家族内最佳 planning 是 `iter_42195, L2=0.6222`；latest 的 masked eval 为 `NDS=0.5076, L2=0.6344` |
 | 官方权重无mask | official | `N/A` | `N/A` | `官方` | `官方 checkpoint` | 标准评估，无相机缺失 | `-` | `0.3706 / 1.2550 / 0.5014 / 0.3486 / 0.6270` | `-` | `-` | `-` | 官方参考 |
 | 官方权重mask后 | official | `N/A` | `N/A` | `官方` | `官方 checkpoint` | mask 鲁棒性评估 | `-` | `0.3543 / 1.2833 / 0.5075 / 0.3298 / 0.6545` | `-` | `-` | `-` | 相机缺失降低 tracking |
 
 ## 结论摘要
 
-- 当前 `work_dirs` 中规划 `L2` 最好的有效实验是 `exp22`，`L2 = 0.6311`
+- 当前 `work_dirs` 中规划 `L2` 最好的有效实验是 `exp27`，最终 checkpoint `L2 = 0.6268`
+- 如果按家族内最佳 checkpoint 看，当前 `work_dirs` 中最好的 planning 结果也是 `exp27`，`iter_42195` 的 `L2 = 0.6222`
 - 当前 `work_dirs` 中 `NDS` 最好的有效实验也是 `exp22`，`NDS = 0.5269`
 - 当前 `work_dirs` 中 `AMOTA` 最好的完整 e2e 实验是 `exp19`，`AMOTA = 0.3905`
 - `exp22-0` 的 `mAP` 虽然最高，但这是一次误加载权重的无效对照，不能作为“基于 exp20 微调”的有效结论
-- 从当前结果看，`exp22` 仍是最均衡的一次规划微调；`exp25` 是次优的稳健版本
-- `exp26` 证明 flow 版 `pv_recon` 训练是可行的；若看最终 checkpoint，tracking 和 motion 指标较强，但若看整个实验过程，最佳 planning checkpoint 实际是第一次评测 `iter_70325`
+- 从当前结果看，`exp22` 仍是最均衡的一次规划微调；但如果只追求 planning，`exp27` 已经超过 `exp22`
+- `exp26` 证明 flow 版 `pv_recon` 训练是可行的；`exp27` 则进一步证明，从 `exp26` 的早期 planning checkpoint 出发做低学习率微调是有效的
+- `exp27` 的 latest checkpoint 在 masked eval 下会退化到 `mAP=0.3896`、`NDS=0.5076`、`AMOTA=0.3517`、`L2=0.6344`，说明它具备一定鲁棒性，但不是专门为 masked eval 优化的最强模型
 
 ## 一、完整 E2E 实验
 
@@ -71,6 +75,7 @@
 | exp24 | `exp23/iter_210975.pth` | 延续冻结微调，`lr=5e-6` | `iter_140650` | 0.4121 | 0.5262 | 0.3772 | 0.4946 | 0.4155 | 0.209% | 0.7116 | 规划与碰撞同时退化 |
 | exp25 | `exp22/iter_140650.pth` | 从 exp22 中期重启，`lr=3e-6` | `iter_281300` | 0.4133 | 0.5264 | 0.3808 | 0.4986 | 0.4158 | 0.104% | 0.6464 | 次优平衡点，tracking 稳 |
 | exp26 | `ckpt/sparsedrive_stage2.pth` | `pv_recon_type='flow'`，`trajectory_source='pred'` | `iter_281300` | 0.4123 | 0.5258 | 0.3810 | 0.5009 | 0.4114 | 0.155% | 0.6603 | flow 补全版本，tracking/motion 强于 exp25，planning 一般 |
+| exp27 | `exp26/iter_70325.pth` | 冻结感知/检测/建图与 `pv_recon`，仅保留 planning 相关模块继续训练，`lr=3e-6` | `iter_70325` | 0.4015 | 0.5157 | 0.3656 | 0.4869 | 0.4042 | 0.113% | 0.6268 | 最终 ckpt 在 planning `L2` 上已优于 exp22；家族内最佳 planning 为 `iter_42195, L2=0.6222` |
 
 ### 关键观察
 
@@ -84,20 +89,25 @@
 - `exp26` 是另一条实验线，不属于 `exp22-25` 的冻结微调家族；它通过 `flow` 版 `pv_recon` 保住了较强的 tracking/motion
 - `exp26` 如果只看最终 checkpoint，规划 `L2=0.6603` 不如 `exp22` 和 `exp25`
 - 但如果看整个 `exp26` 家族，第一次评测 `iter_70325` 的 `L2=0.6329` 实际已经非常接近 `exp22`
+- `exp27` 正是在 `exp26/iter_70325` 基础上继续做低学习率规划微调，结果把最终 `L2` 压到 `0.6268`
+- 如果看 `exp27` 家族内最佳 checkpoint，`iter_42195` 的 `L2=0.6222` 已经是当前所有有效实验中最好的 planning 结果
+- 但如果把 `exp27` 的 latest checkpoint 切到 masked eval，`L2` 会从 `0.6268` 回升到 `0.6344`，`NDS` 会从 `0.5157` 降到 `0.5076`
+- 这说明 `exp27` 更像“标准评测下的 planning 微调最优点”，而不是“mask 鲁棒性最优点”
 
 ### 排名参考
 
 按 `L2` 从优到劣排序：
 
-1. `exp22`：0.6311
-2. `exp20`：0.6429
-3. `exp19`：0.6448
-4. `exp25`：0.6464
-5. `exp26`：0.6603
-6. `exp23`：0.6657
-7. `exp24`：0.7116
-8. `exp21`：0.7314
-9. `exp22-0`：0.7900
+1. `exp27`：0.6268
+2. `exp22`：0.6311
+3. `exp20`：0.6429
+4. `exp19`：0.6448
+5. `exp25`：0.6464
+6. `exp26`：0.6603
+7. `exp23`：0.6657
+8. `exp24`：0.7116
+9. `exp21`：0.7314
+10. `exp22-0`：0.7900
 
 ## 二、历史 Tracking 实验
 
