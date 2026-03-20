@@ -4,10 +4,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${ROOT_DIR}"
 
-CONFIG="${CONFIG:-projects/configs/sparsedrive_small_stage2_exp27.py}"
-CHECKPOINT="${CHECKPOINT:-work_dirs/sparsedrive_small_stage2_exp27/latest.pth}"
+CONFIG="${CONFIG:-projects/configs/sparsedrive_small_stage2_exp28.py}"
+CONFIG_NAME="$(basename "${CONFIG%.py}")"
+CHECKPOINT="${CHECKPOINT:-work_dirs/${CONFIG_NAME}/latest.pth}"
 EVAL_METRIC="${EVAL_METRIC:-bbox}"
-WORK_DIR="${WORK_DIR:-./exp27_mask_eval}"
+WORK_DIR="${WORK_DIR:-./${CONFIG_NAME}_mask_eval}"
 
 # 优先保证在指定 conda 环境下运行
 if [[ "${CONDA_DEFAULT_ENV:-}" != "sparsedrive" ]]; then

@@ -7,4 +7,6 @@ export PYTHONPATH="/home/wudi/code/mySparseDrive/SparseDrive:${PYTHONPATH:-}"
 export CUDA_VISIBLE_DEVICES=0
 # export CUDA_LAUNCH_BLOCKING=1  # 仅调试 CUDA 报错时开启
 
-python tools/train.py projects/configs/sparsedrive_small_stage2_exp27.py "$@"
+CONFIG="${CONFIG:-projects/configs/sparsedrive_small_stage2_exp28.py}"
+
+python tools/train.py "${CONFIG}" "$@"
