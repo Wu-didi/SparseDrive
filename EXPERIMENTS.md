@@ -247,6 +247,72 @@
 - 这个掉幅不算离谱，说明 `exp27` 对相机缺失有一定鲁棒性，但它的优化目标仍然主要是标准评测下的 planning 微调，不是专门为 masked eval 做的鲁棒性优化
 - 结合当前配置看，这个结果也符合预期：`exp27` 冻结了 `pv_recon` 和 `temporal_completion`，所以后半程并没有继续针对“缺失相机补全能力”做强化
 
+## 2026-03 exp28: 从 exp27 最佳 planning 点继续做 masked robustness 微调
+
+### 实验目标
+
+验证从 `exp27` 的最佳 planning checkpoint `iter_42195` 出发，重新放开 `pv_recon` 和 `temporal_completion`，同时缩短 mask curriculum，能否在 **masked eval** 口径下进一步降低 planning `L2` 并提升鲁棒性。
+
+### 实验配置
+
+- 配置文件：`projects/configs/sparsedrive_small_stage2_exp28.py`
+- 初始化权重：`work_dirs/sparsedrive_small_stage2_exp27/iter_42195.pth`
+- 评测口径：`test_cam_missing=True`，本实验所有评测结果都是 **masked eval**
+- 冻结模块：`img_backbone`、`img_neck`、`depth_branch`、`world_model`、`head.det_head`、`head.map_head`
+- 放开模块：`pv_recon`、`temporal_completion`、`planning_weighting`、`planning_guided_completion`、`head.motion_plan_head`
+- `cam_dropout`：`curriculum_steps=1000`，`p_missing_start=0.35`，最终仍为 `p_missing=0.6`
+- `flow pv_recon` 权重：`lambda_flow=0.003`
+- 学习率：`lr=2e-6`
+- 训练长度：`28130 iter`
+- 评测频率：每 `7032 iter` 做一次完整评测
+
+### 全部评测结果
+
+`exp28` 一共做了 4 次完整评测，分别对应：
+
+- `iter_7032`
+- `iter_14064`
+- `iter_21096`
+- `iter_28130`
+
+结果来源：
+
+- 4 次评测都记录在 `work_dirs/sparsedrive_small_stage2_exp28/20260319_112505.log`
+- 最终一次评测同时写入了 `work_dirs/sparsedrive_small_stage2_exp28/e2e_metrics.json`
+
+#### checkpoint 级结果总表
+
+| checkpoint | mAP | NDS | AMOTA | mAP_normal | car EPA | ped EPA | obj_box_col | L2 | 备注 |
+|------------|-----|-----|-------|------------|---------|---------|-------------|----|------|
+| iter_7032 | 0.3868 | 0.5021 | 0.3472 | 0.5132 | 0.4759 | 0.3909 | 0.157% | 0.6410 | 第一次评测，family 内次优 L2 |
+| iter_14064 | **0.3903** | **0.5062** | 0.3520 | 0.5148 | 0.4769 | 0.3916 | 0.149% | 0.6534 | detection / NDS 最好 |
+| iter_21096 | 0.3881 | 0.5040 | **0.3529** | **0.5173** | 0.4770 | 0.3931 | 0.131% | 0.6607 | 中期 L2 最差 |
+| iter_28130 | 0.3883 | 0.5042 | 0.3511 | 0.5124 | **0.4780** | **0.3952** | **0.105%** | **0.6394** | 最终 checkpoint，family 内 planning / 安全性最好 |
+
+#### 详细指标表
+
+| checkpoint | car ADE / FDE / MR | pedestrian ADE / FDE / MR | AMOTP / Recall / MOTA / MOTP |
+|------------|---------------------|----------------------------|-------------------------------|
+| iter_7032 | 0.6454 / 0.9978 / 0.1342 | 0.7346 / 1.0701 / 0.1466 | 1.2796 / 0.4950 / 0.3196 / 0.6629 |
+| iter_14064 | 0.6451 / 0.9969 / 0.1349 | 0.7326 / 1.0706 / 0.1475 | 1.2814 / 0.4907 / 0.3191 / 0.6693 |
+| iter_21096 | 0.6466 / 0.9961 / 0.1316 | 0.7374 / 1.0731 / 0.1498 | 1.2820 / 0.4856 / 0.3202 / 0.6707 |
+| iter_28130 | 0.6433 / 0.9957 / 0.1326 | 0.7262 / 1.0534 / 0.1460 | 1.2856 / 0.4956 / 0.3177 / 0.6713 |
+
+### 结果分析
+
+- `exp28` 没有验证最初的正向假设：重新放开 `pv_recon` / `temporal_completion` 并缩短 curriculum，并没有把 masked eval 指标继续拉高
+- 与 `exp27` 的 latest masked eval 相比，`exp28` 最终 checkpoint 从 `mAP=0.3896 / NDS=0.5076 / AMOTA=0.3517 / obj_box_col=0.125% / L2=0.6344` 变成 `0.3883 / 0.5042 / 0.3511 / 0.105% / 0.6394`
+- 也就是说，`exp28` 的优势主要体现在 **碰撞更低**，但 `L2` 和 `NDS` 都没有超过 `exp27` 的 masked baseline
+- 从 family 内部看，`iter_14064` 的 detection / NDS 最好，但 planning 已经明显回退；最终 `iter_28130` 把 `obj_box_col` 压到最低，也把 `L2` 拉回到 family 内最好，但仍未超过 `exp27 masked`
+- 这说明“放开补全模块 + 低学习率继续训”这件事本身并不足以自动带来更强的 masked planning；当前更像是引入了新的 trade-off，而不是单向提升
+
+### 当前结论
+
+- 如果目标是 **masked eval 下的 planning 最优**，`exp28` 目前不如 `exp27 latest masked`，后者 `L2 = 0.6344`
+- `exp28` 的最终 checkpoint `iter_28130` 仍有价值：`obj_box_col = 0.105%` 是当前 masked 口径下更安全的一个点
+- 但从整体看，`exp28` 证明“仅靠重开放开 `pv_recon` / `temporal_completion` + 缩短 curriculum”还不够，当前方案没有把 masked `L2` 继续压下去
+- 下一步如果还要继续做 mask robustness，更值得尝试的是更明确的 checkpoint 选择策略或更直接的 loss 设计，而不是沿 `exp28` 继续默认往后训
+
 ## V2 版本实验（局部注意力优化）
 
 ### 实验目标
