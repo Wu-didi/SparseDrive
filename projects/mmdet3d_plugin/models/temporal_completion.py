@@ -33,6 +33,7 @@ class FeatureQueue:
         self.T_global_queue: List[np.ndarray] = []
         self.timestamp_queue: List[np.ndarray] = []
         self.scene_token_queue: List[List[Optional[str]]] = []
+        self.cam_mask_queue: List[np.ndarray] = []
         self.batch_size: Optional[int] = None
 
     def _extract_batch_t_global(self, metas: Dict, batch_size: int) -> np.ndarray:
@@ -90,13 +91,14 @@ class FeatureQueue:
                 return True
         return False
 
-    def push(self, feat: torch.Tensor, metas: Dict):
+    def push(self, feat: torch.Tensor, metas: Dict, cam_mask: Optional[torch.Tensor] = None):
         """
         添加新帧到队列（只存储单一尺度特征）
 
         Args:
             feat: Tensor [B, V, C, H, W]，单一尺度特征
             metas: 包含 'img_metas' 的字典
+            cam_mask: Tensor [B, V]，True 表示该相机在当前帧缺失
         """
         if metas is None:
             metas = {}
@@ -104,9 +106,26 @@ class FeatureQueue:
             metas = {"img_metas": metas} if isinstance(metas, list) else {}
 
         batch_size = feat.shape[0]
+        num_cams = feat.shape[1]
         T_global = self._extract_batch_t_global(metas, batch_size)
         timestamp = self._extract_batch_timestamps(metas, batch_size)
         scene_tokens = self._extract_scene_tokens(metas, batch_size)
+        if cam_mask is None:
+            cam_mask_np = np.zeros((batch_size, num_cams), dtype=np.bool_)
+        else:
+            if isinstance(cam_mask, torch.Tensor):
+                cam_mask_t = cam_mask.detach().cpu().to(dtype=torch.bool)
+            else:
+                cam_mask_t = torch.as_tensor(cam_mask, dtype=torch.bool)
+            if cam_mask_t.dim() == 1:
+                cam_mask_t = cam_mask_t.unsqueeze(0).expand(batch_size, -1)
+            if cam_mask_t.dim() != 2:
+                raise ValueError("cam_mask should be [B, V]")
+            if cam_mask_t.shape[0] == 1 and batch_size > 1:
+                cam_mask_t = cam_mask_t.expand(batch_size, -1)
+            if cam_mask_t.shape != (batch_size, num_cams):
+                raise ValueError("cam_mask shape should match feature batch and camera count")
+            cam_mask_np = cam_mask_t.numpy().astype(np.bool_, copy=True)
 
         # 场景切换检测：batch size 改变 / scene 改变 / 时间间隔过大都清空队列
         if self.batch_size is not None and self.batch_size != batch_size:
@@ -128,6 +147,7 @@ class FeatureQueue:
         self.T_global_queue.append(T_global.copy())
         self.timestamp_queue.append(timestamp)
         self.scene_token_queue.append(scene_tokens)
+        self.cam_mask_queue.append(cam_mask_np)
         self.batch_size = batch_size
 
         # 保持队列长度
@@ -136,10 +156,11 @@ class FeatureQueue:
             self.T_global_queue.pop(0)
             self.timestamp_queue.pop(0)
             self.scene_token_queue.pop(0)
+            self.cam_mask_queue.pop(0)
 
-    def get(self) -> Tuple[List[torch.Tensor], List[np.ndarray], List[np.ndarray]]:
+    def get(self) -> Tuple[List[torch.Tensor], List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
         """获取历史特征和元数据"""
-        return self.feature_queue, self.T_global_queue, self.timestamp_queue
+        return self.feature_queue, self.T_global_queue, self.timestamp_queue, self.cam_mask_queue
 
     def __len__(self):
         return len(self.feature_queue)
@@ -398,6 +419,7 @@ class TemporalCrossAttention(nn.Module):
     def forward(self,
                 query_cam_idx: int,
                 history_feats: torch.Tensor,
+                history_valid_mask: Optional[torch.Tensor],
                 H: int, W: int) -> torch.Tensor:
         """
         对单个失效相机进行补全（显存优化版）
@@ -405,6 +427,7 @@ class TemporalCrossAttention(nn.Module):
         Args:
             query_cam_idx: 失效相机索引
             history_feats: [B, V, T, C, H, W] 所有相机的历史特征（已 warp）
+            history_valid_mask: [B, V, T]，True 表示对应历史 token 可用
             H, W: 输出特征图尺寸
 
         Returns:
@@ -439,6 +462,19 @@ class TemporalCrossAttention(nn.Module):
         # 展平
         kv_flat = kv.permute(0, 1, 2, 4, 5, 3).reshape(B, V * T * H_kv * W_kv, C)
 
+        kv_valid_flat = None
+        has_valid_history = None
+        if history_valid_mask is not None:
+            history_valid_mask = history_valid_mask.to(device=device, dtype=torch.bool)
+            if history_valid_mask.shape != (B, V, T):
+                raise ValueError("history_valid_mask should be [B, V, T]")
+            kv_valid_flat = (
+                history_valid_mask.view(B, V, T, 1, 1)
+                .expand(-1, -1, -1, H_kv, W_kv)
+                .reshape(B, V * T * H_kv * W_kv)
+            )
+            has_valid_history = kv_valid_flat.any(dim=-1, keepdim=True)
+
         # 3. 投影
         q = self.q_proj(query_flat)  # [B, H*W, C]
         k = self.k_proj(kv_flat)      # [B, V*T*H_kv*W_kv, C]
@@ -463,6 +499,9 @@ class TemporalCrossAttention(nn.Module):
             )
         key_cam_weight = cam_row.repeat_interleave(T * H_kv * W_kv).clamp(min=1e-4)  # [L]
         attn_bias = key_cam_weight.log().view(1, 1, 1, -1)  # [1,1,1,L]
+        if kv_valid_flat is not None:
+            invalid_bias = (~kv_valid_flat).to(dtype=q.dtype).view(B, 1, 1, -1) * q.new_tensor(-1e4)
+            attn_bias = attn_bias + invalid_bias
 
         # 注意力分数（可选 SDPA）
         if self.use_flash_attn and hasattr(F, "scaled_dot_product_attention"):
@@ -482,6 +521,8 @@ class TemporalCrossAttention(nn.Module):
         # 输出投影
         out = self.out_proj(out)
         out = self.norm(out)
+        if has_valid_history is not None:
+            out = out * has_valid_history.to(dtype=out.dtype).view(B, 1, 1)
         out = out.permute(0, 2, 1).reshape(B, C, H, W)
 
         return out
@@ -564,12 +605,14 @@ class MotionCompensatedTemporalCompletion(nn.Module):
                  reference_depths: List[float] = [10, 30],  # 减少深度假设
                  kv_downsample: int = 4,  # Key/Value 下采样
                  use_flash_attn: bool = False,
+                 cross_scale_residual: float = 0.5,
                  enable: bool = True):
         super().__init__()
         self.enable = enable
         self.num_scales = len(ch_per_scale)
         self.num_cameras = num_cameras
         self.queue_length = queue_length
+        self.cross_scale_residual = float(cross_scale_residual)
 
         if not enable:
             return
@@ -719,12 +762,12 @@ class MotionCompensatedTemporalCompletion(nn.Module):
         )
 
         # 获取历史特征
-        history_feats, T_global_queue, _ = self.feature_queue.get()
+        history_feats, T_global_queue, _, history_mask_queue = self.feature_queue.get()
 
         if len(history_feats) == 0:
             # 没有历史帧，更新队列后返回原始特征
             with torch.no_grad():
-                self.feature_queue.push(feat_process_raw, metas)
+                self.feature_queue.push(feat_process_raw, metas, cam_mask=cam_mask)
             return current_feats
 
         # 获取当前帧的变换矩阵（batch）
@@ -732,7 +775,7 @@ class MotionCompensatedTemporalCompletion(nn.Module):
         if img_metas is None or not isinstance(img_metas, list) or len(img_metas) == 0:
             # 没有有效的 img_metas，跳过时序补全
             with torch.no_grad():
-                self.feature_queue.push(feat_process_raw, metas)
+                self.feature_queue.push(feat_process_raw, metas, cam_mask=cam_mask)
             return current_feats
 
         T_global_cur = self._extract_batch_t_global(metas, B, device)  # [B, 4, 4]
@@ -740,6 +783,7 @@ class MotionCompensatedTemporalCompletion(nn.Module):
 
         # 计算 T_temp2cur 并 warp 历史特征
         warped_history = []
+        history_valid_masks = []
         for t, (hist_feat, T_global_hist) in enumerate(zip(history_feats, T_global_queue)):
             if hist_feat.shape[0] != B:
                 continue
@@ -756,17 +800,30 @@ class MotionCompensatedTemporalCompletion(nn.Module):
             for v in range(V):
                 warped = self.motion_warp(hist_feat[:, v], T_temp2cur, lidar2img[:, v], self.img_shape)
                 warped_cams.append(warped)
+            hist_cam_mask = history_mask_queue[t] if t < len(history_mask_queue) else None
+            if hist_cam_mask is None:
+                hist_cam_mask_t = torch.zeros((B, V), dtype=torch.bool, device=device)
+            else:
+                hist_cam_mask_t = torch.as_tensor(hist_cam_mask, dtype=torch.bool, device=device)
+                if hist_cam_mask_t.dim() == 1:
+                    hist_cam_mask_t = hist_cam_mask_t.unsqueeze(0).expand(B, -1)
+                if hist_cam_mask_t.shape[0] == 1 and B > 1:
+                    hist_cam_mask_t = hist_cam_mask_t.expand(B, -1)
+                if hist_cam_mask_t.shape != (B, V):
+                    continue
             warped_hist = torch.stack(warped_cams, dim=1)
             warped_history.append(warped_hist)
+            history_valid_masks.append(~hist_cam_mask_t)
 
         if len(warped_history) == 0:
             with torch.no_grad():
-                self.feature_queue.push(feat_process_raw, metas)
+                self.feature_queue.push(feat_process_raw, metas, cam_mask=cam_mask)
             return current_feats
 
         # 堆叠历史帧 [B, V, T, C, H, W]
         warped_history = torch.stack(warped_history, dim=2)
         T_actual = warped_history.shape[2]
+        history_valid = torch.stack(history_valid_masks, dim=2)
 
         # 适配到 embed_dims
         warped_adapted = self.feat_adapter(warped_history.view(B * V * T_actual, C, H, W))
@@ -780,8 +837,8 @@ class MotionCompensatedTemporalCompletion(nn.Module):
         cond_current = (current_adapted * valid_mask).sum(dim=1) / valid_count  # [B, C, H, W]
 
         # 历史条件（仅聚合有效视角）
-        valid_mask_hist = (~cam_mask).view(B, V, 1, 1, 1, 1).to(dtype=warped_adapted.dtype)
-        hist_count = (valid_mask_hist.sum(dim=1) * max(T_actual, 1)).squeeze(1).clamp(min=1.0)
+        valid_mask_hist = history_valid.view(B, V, T_actual, 1, 1, 1).to(dtype=warped_adapted.dtype)
+        hist_count = valid_mask_hist.sum(dim=(1, 2)).clamp(min=1.0)
         cond_history = (warped_adapted * valid_mask_hist).sum(dim=1).sum(dim=1) / hist_count
         cond_context = self.cond_fusion(torch.cat([cond_current, cond_history], dim=1))
 
@@ -797,6 +854,7 @@ class MotionCompensatedTemporalCompletion(nn.Module):
             completed = self.temporal_attention(
                 query_cam_idx=v,
                 history_feats=warped_adapted,
+                history_valid_mask=history_valid,
                 H=H, W=W,
             )
 
@@ -822,11 +880,27 @@ class MotionCompensatedTemporalCompletion(nn.Module):
         # 更新历史队列
         with torch.no_grad():
             # 将补全结果写入记忆，减少缺失特征在队列中传播
-            self.feature_queue.push(feat_out, metas)
+            self.feature_queue.push(feat_out, metas, cam_mask=cam_mask)
 
         # 构建输出：只更新处理的尺度
         outputs = list(current_feats)
         outputs[self.process_scale_idx] = feat_out
+        if self.cross_scale_residual > 0:
+            delta = (feat_out - feat_process_raw).view(B * V, C, H, W)
+            miss = cam_mask.view(B, V, 1, 1, 1).to(dtype=feat_process_raw.dtype)
+            for scale_idx, feat_scale in enumerate(current_feats):
+                if scale_idx == self.process_scale_idx:
+                    continue
+                if feat_scale.shape[2] != C:
+                    continue
+                H_s, W_s = feat_scale.shape[-2:]
+                delta_scale = F.interpolate(
+                    delta,
+                    size=(H_s, W_s),
+                    mode="bilinear",
+                    align_corners=False,
+                ).view(B, V, C, H_s, W_s)
+                outputs[scale_idx] = feat_scale + delta_scale * miss * self.cross_scale_residual
 
         return outputs
 

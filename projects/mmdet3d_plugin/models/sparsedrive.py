@@ -1,5 +1,6 @@
 import copy
 import math
+import warnings
 from inspect import signature
 from collections import OrderedDict
 
@@ -1743,9 +1744,10 @@ class SparseDrive(BaseDetector):
         if planning_guided_completion_cfg is None:
             planning_guided_completion_cfg = {}
         pgc_enable = planning_guided_completion_cfg.get('enable', True)
-        self.trajectory_source = planning_guided_completion_cfg.get('trajectory_source', 'pred')
+        self.trajectory_source = planning_guided_completion_cfg.get('trajectory_source', 'gt')
         if self.trajectory_source not in ("none", "gt", "pred"):
             raise ValueError("planning_guided_completion_cfg.trajectory_source must be 'none'/'gt'/'pred'")
+        self._pred_trajectory_train_fallback_warned = False
         self.planning_guided_completion = PlanningGuidedCompletion(
             ch_per_scale=planning_guided_completion_cfg.get('ch_per_scale', [256, 256, 256, 256]),
             hidden_dim=planning_guided_completion_cfg.get('hidden_dim', 256),
@@ -1934,6 +1936,68 @@ class SparseDrive(BaseDetector):
 
         return total_loss * self.ssl_weight
 
+    def _normalize_cam_mask(self, cam_mask, batch_size, num_cams, device):
+        if cam_mask is None:
+            return None
+
+        if hasattr(cam_mask, "data") and not torch.is_tensor(cam_mask):
+            cam_mask = cam_mask.data
+        if isinstance(cam_mask, (list, tuple)):
+            if len(cam_mask) == 1:
+                cam_mask = cam_mask[0]
+                if hasattr(cam_mask, "data") and not torch.is_tensor(cam_mask):
+                    cam_mask = cam_mask.data
+            elif all(torch.is_tensor(x) for x in cam_mask):
+                cam_mask = torch.stack([x.to(device=device) for x in cam_mask], dim=0)
+            else:
+                cam_mask = torch.as_tensor(cam_mask, device=device)
+        elif not torch.is_tensor(cam_mask):
+            cam_mask = torch.as_tensor(cam_mask, device=device)
+        else:
+            cam_mask = cam_mask.to(device=device)
+
+        if cam_mask.dim() == 3 and cam_mask.shape[0] == 1:
+            cam_mask = cam_mask.squeeze(0)
+        if cam_mask.dim() == 1:
+            if cam_mask.shape[0] != num_cams:
+                raise ValueError("cam_mask length should match num_cams")
+            cam_mask = cam_mask.unsqueeze(0).expand(batch_size, -1)
+        elif cam_mask.dim() == 2 and cam_mask.shape[0] == 1 and batch_size > 1:
+            cam_mask = cam_mask.expand(batch_size, -1)
+
+        if cam_mask.dim() != 2 or cam_mask.shape != (batch_size, num_cams):
+            raise ValueError("cam_mask should have shape [B, V]")
+        return cam_mask.to(device=device, dtype=torch.bool)
+
+    def _apply_cam_mask_to_images(self, img, cam_mask):
+        if cam_mask is None:
+            return img
+        if img.dim() == 5:
+            return img * (~cam_mask).view(img.shape[0], img.shape[1], 1, 1, 1).to(img.dtype)
+        if img.dim() == 4 and cam_mask.shape[1] == 1:
+            return img * (~cam_mask).view(img.shape[0], 1, 1, 1).to(img.dtype)
+        return img
+
+    def _resolve_cam_mask_input(self, img, data, sample_if_missing=False):
+        batch_size = img.shape[0]
+        num_cams = img.shape[1] if img.dim() == 5 else 1
+        cam_mask = self._normalize_cam_mask(
+            data.get("cam_mask", None),
+            batch_size=batch_size,
+            num_cams=num_cams,
+            device=img.device,
+        )
+        if cam_mask is not None:
+            return self._apply_cam_mask_to_images(img, cam_mask), cam_mask
+        if sample_if_missing:
+            img_masked, cam_mask = self.cam_dropout(
+                img,
+                return_mask=True,
+                metas=data.get("img_metas", None),
+            )
+            return img_masked, cam_mask.to(img.device, dtype=torch.bool)
+        return img, None
+
     def _extract_ego_state(self, data, device):
         ego_state = None
         if "can_bus" in data and data["can_bus"] is not None:
@@ -2115,23 +2179,35 @@ class SparseDrive(BaseDetector):
 
         return traj
 
-    def _extract_completion_trajectory(self, data, device, feature_maps=None):
-        if self.trajectory_source == "none":
-            return None
-
-        if self.trajectory_source == "pred":
-            traj_pred = self._extract_predicted_trajectory(feature_maps, data)
-            if traj_pred is None:
-                return None
-            return traj_pred.to(device=device, dtype=torch.float32)
-
-        # trajectory_source == "gt"
+    def _extract_gt_completion_trajectory(self, data, device):
         traj = data.get("ego_fut_trajs", None)
         if traj is None:
             traj = data.get("gt_ego_fut_trajs", None)
         if traj is None:
             return None
         return torch.as_tensor(traj, dtype=torch.float32, device=device)
+
+    def _extract_completion_trajectory(self, data, device, feature_maps=None):
+        if self.trajectory_source == "none":
+            return None
+
+        if self.trajectory_source == "pred":
+            if self.training:
+                traj_gt = self._extract_gt_completion_trajectory(data, device)
+                if not self._pred_trajectory_train_fallback_warned:
+                    warnings.warn(
+                        "[SparseDrive] trajectory_source='pred' falls back to GT/none during training "
+                        "to avoid an extra detached head forward."
+                    )
+                    self._pred_trajectory_train_fallback_warned = True
+                return traj_gt
+            traj_pred = self._extract_predicted_trajectory(feature_maps, data)
+            if traj_pred is None:
+                return None
+            return traj_pred.to(device=device, dtype=torch.float32)
+
+        # trajectory_source == "gt"
+        return self._extract_gt_completion_trajectory(data, device)
 
     # -----------------------
     # 主 forward
@@ -2153,13 +2229,14 @@ class SparseDrive(BaseDetector):
         # 1) 保留一份 full images，用于 SSL teacher
         img_full = img.clone()
 
-        # 2) 随机相机遮挡，得到 masked images + cam_mask
-        img_masked, cam_mask = self.cam_dropout(
+        # 2) 优先使用外部相机可用性标注；缺失时再采样模拟缺失
+        img_masked, cam_mask = self._resolve_cam_mask_input(
             img,
-            return_mask=True,
-            metas=data.get("img_metas", None),
+            data,
+            sample_if_missing=True,
         )
-        cam_mask = cam_mask.to(img.device)
+        if cam_mask is None:
+            cam_mask = torch.zeros((B, V), dtype=torch.bool, device=img.device)
 
         # 3) masked 分支：带梯度的 backbone+neck（student）
         feats_mask_base = self._extract_backbone_neck(
@@ -2291,14 +2368,11 @@ class SparseDrive(BaseDetector):
             return self.simple_test(img, **data)
 
     def simple_test(self, img, **data):
-        cam_mask = None
-        # 仅在配置里开启时，才在测试阶段模拟相机缺失
-        if getattr(self, "test_cam_missing", False):
-            img, cam_mask = self.cam_dropout(
-                img,
-                return_mask=True,
-                metas=data.get("img_metas", None),
-            )
+        img, cam_mask = self._resolve_cam_mask_input(
+            img,
+            data,
+            sample_if_missing=getattr(self, "test_cam_missing", False),
+        )
 
         # 提取特征
         feature_maps = self.extract_feat(
