@@ -5,13 +5,18 @@
 *.swp
 
 data/
+data
 ckpt/
+ckpt
 work_dirs*/
 dist_test/
 vis/
 val/
 lib/
 work_dirs/
+work_dirs
+*_mask_eval/
+*_standard_eval/
 *.egg-info
 build/
 __pycache__/
