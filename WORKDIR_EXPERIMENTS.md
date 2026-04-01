@@ -1,6 +1,6 @@
 # Work_dirs 实验总览
 
-更新时间：2026-03-26
+更新时间：2026-04-01
 
 数据来源：
 
@@ -51,6 +51,7 @@
 | exp30 | e2e | `sparsedrive_small_stage2_exp30.py` | `unknown` | `exp30` | `ckpt/sparsedrive_stage2.pth` | 论文最小版 masked robustness：保留 `temporal_completion + flow pv_recon`，关闭 `world_model/planning_guided_completion`，全量训练 | `0.3936 / 0.5130` | `0.3541 / 1.2679 / 0.4730 / 0.3247 / 0.6161` | `0.5192` | `0.4785 / 0.6341 / 0.9779 / 0.1337 ; 0.3886 / 0.7521 / 1.0969 / 0.1520` | `0.6702% / 0.1378% / 0.6569` | masked eval 口径；最终 ckpt 已过训，family 内最佳 planning 是 `iter_70325, L2=0.6232`，优于 `exp27` masked 的 `0.6344` 和 `exp28` 的 `0.6394` |
 | exp31 | e2e | `sparsedrive_small_stage2_exp31.py` | `unknown` | `exp31` | `exp30/iter_70325.pth` | 从 `exp30` 最佳 checkpoint 继续训练，仅降低 `lr=1e-6`，masked eval 口径 | `0.3978 / 0.5085` | `0.3528 / 1.2635 / 0.4942 / 0.3208 / 0.6538` | `0.5231` | `0.4823 / 0.6293 / 0.9731 / 0.1321 ; 0.3899 / 0.7530 / 1.1000 / 0.1503` | `0.6702% / 0.1384% / 0.6525` | masked eval 口径；family 内最佳 checkpoint 为 `iter_70325, mAP=0.4018, NDS=0.5152, L2=0.6379`；说明更小 lr 改善了感知，但没有超过 `exp30-best` 的 planning |
 | exp32 | e2e | `sparsedrive_small_stage2_exp32.py` | `unknown` | `exp32` | `ckpt/sparsedrive_stage2.pth` | 基于 `exp30` 结构重构训练策略：每 epoch eval/checkpoint、拉长 curriculum、降低旧模块 lr_mult；已补 `iter_140650` 标准 eval | `0.4133 / 0.5252` | `0.3756 / 1.2380 / 0.4735 / 0.3446 / 0.6019` | `0.5642` | `0.4904 / 0.6120 / 0.9484 / 0.1318 ; 0.4165 / 0.7323 / 1.0748 / 0.1472` | `0.6702% / 0.0863% / 0.5987` | 标准 eval 口径，checkpoint=`iter_140650`；标准评测结果已归档到 `work_dirs/sparsedrive_small_stage2_exp32_standard_eval/`；同一 checkpoint 的 masked eval 为 `mAP=0.4007, NDS=0.5140, L2=0.6096`，训练 latest `iter_182845` 的 masked 结果为 `mAP=0.3929, NDS=0.5052, L2=0.6274` |
+| exp32-seed42 | e2e | `sparsedrive_small_stage2_exp32.py` | `unknown` | `exp32` | `ckpt/sparsedrive_stage2.pth` | `exp32` 多 seed 复现（`seed=42`），masked eval 口径，当前训练到 `iter_196910` | `0.4014 / 0.5124` | `0.3542 / 1.2607 / 0.5126 / 0.3260 / 0.6672` | `0.5059` | `0.4792 / 0.6292 / 0.9715 / 0.1338 ; 0.4011 / 0.7350 / 1.0721 / 0.1453` | `0.6702% / 0.1058% / 0.6220` | masked eval 口径；当前 latest 可用评测为 `iter_196910`；观测到的 best NDS 在 `iter_28130=0.5137`，best planning 在 `iter_168780, L2=0.6163` |
 | 官方权重无mask | official | `N/A` | `N/A` | `官方` | `官方 checkpoint` | 标准评估，无相机缺失 | `-` | `0.3706 / 1.2550 / 0.5014 / 0.3486 / 0.6270` | `-` | `-` | `-` | 官方参考 |
 | 官方权重mask后 | official | `N/A` | `N/A` | `官方` | `官方 checkpoint` | mask 鲁棒性评估 | `-` | `0.3543 / 1.2833 / 0.5075 / 0.3298 / 0.6545` | `-` | `-` | `-` | 相机缺失降低 tracking |
 
@@ -63,6 +64,7 @@
 - 按 masked eval 口径看，当前 detection / NDS 最好的 checkpoint 已经变成 `exp31/iter_70325`，`mAP = 0.4018`、`NDS = 0.5152`
 - 按 masked eval 口径看，当前 planning 最好的 checkpoint 已经变成 `exp32/iter_140650`，`L2 = 0.6096`
 - `exp32/iter_140650` 的标准 eval 同时达到 `mAP = 0.4133`、`NDS = 0.5252`、`L2 = 0.5987`，说明这条 masked robustness 训练线已经反向提升了标准场景规划表现
+- `exp32` 的 `seed=42` 复现目前 latest masked 结果达到 `mAP = 0.4014`、`NDS = 0.5124`、`L2 = 0.6220`，已经比较接近原始 `seed=0` 主结果；当前观测到的 best planning 在 `iter_168780, L2 = 0.6163`
 - `exp22-0` 的 `mAP` 虽然最高，但这是一次误加载权重的无效对照，不能作为“基于 exp20 微调”的有效结论
 - 从当前结果看，`exp22` 仍保持最高 `NDS=0.5269`；但如果更关注 planning，`exp32/iter_140650` 已经明显超过 `exp27` 和 `exp22`
 - `exp26` 证明 flow 版 `pv_recon` 训练是可行的；`exp27` 则进一步证明，从 `exp26` 的早期 planning checkpoint 出发做低学习率微调是有效的
@@ -92,6 +94,7 @@
 | exp30 | `ckpt/sparsedrive_stage2.pth` | 论文最小版：保留 `temporal_completion + flow pv_recon`，关闭 `world_model/planning_guided_completion`，masked eval 口径 | `iter_210975` | 0.3936 | 0.5130 | 0.3541 | 0.4785 | 0.3886 | 0.138% | 0.6569 | 这是 masked eval 实验，不纳入无 mask 主排名；family 内最佳 checkpoint 为 `iter_70325, mAP=0.3988, NDS=0.5119, L2=0.6232` |
 | exp31 | `work_dirs/sparsedrive_small_stage2_exp30/iter_70325.pth` | 在 `exp30-best@70325` 基础上继续训练，仅降低 `lr=1e-6`，masked eval 口径 | `iter_140650` | 0.3978 | 0.5085 | 0.3528 | 0.4823 | 0.3899 | 0.138% | 0.6525 | 这是 masked eval 实验，不纳入无 mask 主排名；family 内最佳 checkpoint 为 `iter_70325, mAP=0.4018, NDS=0.5152, L2=0.6379` |
 | exp32 | `ckpt/sparsedrive_stage2.pth` | 保持 `exp30` 结构不变，但改为每 epoch 评估、拉长 curriculum、降低旧模块 lr_mult；现已补 `iter_140650` 的标准 eval | `iter_140650（标准 eval）` | 0.4133 | 0.5252 | 0.3756 | 0.4904 | 0.4165 | 0.086% | 0.5987 | 标准评测结果已归档到 `work_dirs/sparsedrive_small_stage2_exp32_standard_eval/`；同一 checkpoint 的 masked 指标为 `mAP=0.4007, NDS=0.5140, L2=0.6096`，训练 latest `iter_182845` 的 masked 结果为 `L2=0.6274` |
+| exp32-seed42 | `ckpt/sparsedrive_stage2.pth` | `exp32` 多 seed 复现（`seed=42`），masked eval 口径，当前训练到 `iter_196910` | `iter_196910（masked latest）` | 0.4014 | 0.5124 | 0.3542 | 0.4792 | 0.4011 | 0.106% | 0.6220 | 当前 latest 可用评测已经接近 `exp32` 主结果；观测到的 best NDS 为 `iter_28130=0.5137`，best planning 为 `iter_168780, L2=0.6163` |
 
 ### 关键观察
 
@@ -125,6 +128,9 @@
 - 这说明更慢的 curriculum、每 epoch 评估，以及更保守的旧模块学习率，确实把 planning 收益和感知收益更好地统一到了同一个 checkpoint 上
 - 对同一个 `exp32/iter_140650` 补做标准 eval 后，结果进一步达到 `mAP=0.4133`、`NDS=0.5252`、`L2=0.5987`
 - 这意味着 `exp32` 不仅是当前 masked planning 最优，也已经超过现有标准 eval 下的 planning 最优点：`exp27 family best=0.6222`、`exp27 latest=0.6268`、`exp22 latest=0.6311`
+- `exp32` 的 `seed=42` 复现目前也跑出了稳定的 masked 结果：latest `iter_196910` 达到 `mAP=0.4014`、`NDS=0.5124`、`L2=0.6220`
+- 从当前日志看，`seed=42` 的最佳点也出现在中后期而不是最后一次评估：当前观测到的 best NDS 在 `iter_28130=0.5137`，best planning 在 `iter_168780, L2=0.6163`
+- 这说明 `exp32` 的收益不是单个 seed 的偶然点，但不同 seed 间最优 checkpoint 位置和 planning 极值仍有一定波动
 - 因为 `exp28` 是 masked eval 口径，下面的 `L2` 排名仍只统计标准 eval 的实验
 
 ### 排名参考
@@ -146,24 +152,28 @@
 按 masked eval 口径下的 planning `L2` 参考排序：
 
 1. `exp32` family best `iter_140650`：0.6096
-2. `exp30` family best `iter_70325`：0.6232
-3. `exp32` latest：0.6274
-4. `exp27_mask_eval` latest：0.6344
-5. `exp31` family best `iter_70325`：0.6379
-6. `exp28` latest：0.6394
-7. `exp31` latest：0.6525
-8. `exp30` latest：0.6569
+2. `exp32-seed42` 当前 best `iter_168780`：0.6163
+3. `exp30` family best `iter_70325`：0.6232
+4. `exp32-seed42` latest `iter_196910`：0.6220
+5. `exp32` latest：0.6274
+6. `exp27_mask_eval` latest：0.6344
+7. `exp31` family best `iter_70325`：0.6379
+8. `exp28` latest：0.6394
+9. `exp31` latest：0.6525
+10. `exp30` latest：0.6569
 
 按 masked eval 口径下的 detection / NDS 参考排序：
 
 1. `exp31` family best `iter_70325`：`mAP=0.4018`, `NDS=0.5152`
 2. `exp32` family best `iter_140650`：`mAP=0.4007`, `NDS=0.5140`
-3. `exp30` latest：`mAP=0.3936`, `NDS=0.5130`
-4. `exp30` family best `iter_70325`：`mAP=0.3988`, `NDS=0.5119`
-5. `exp31` latest：`mAP=0.3978`, `NDS=0.5085`
-6. `exp27_mask_eval` latest：`mAP=0.3896`, `NDS=0.5076`
-7. `exp32` latest：`mAP=0.3929`, `NDS=0.5052`
-8. `exp28` latest：`mAP=0.3883`, `NDS=0.5042`
+3. `exp32-seed42` 当前 best NDS `iter_28130`：`mAP=0.3959`, `NDS=0.5137`
+4. `exp30` latest：`mAP=0.3936`, `NDS=0.5130`
+5. `exp32-seed42` latest：`mAP=0.4014`, `NDS=0.5124`
+6. `exp30` family best `iter_70325`：`mAP=0.3988`, `NDS=0.5119`
+7. `exp31` latest：`mAP=0.3978`, `NDS=0.5085`
+8. `exp27_mask_eval` latest：`mAP=0.3896`, `NDS=0.5076`
+9. `exp32` latest：`mAP=0.3929`, `NDS=0.5052`
+10. `exp28` latest：`mAP=0.3883`, `NDS=0.5042`
 
 ## 二、历史 Tracking 实验
 
