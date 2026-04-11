@@ -2236,7 +2236,7 @@ class SparseDrive(BaseDetector):
         # 2) 优先使用外部相机可用性标注；缺失时再采样模拟缺失
         img_masked, cam_mask = self._resolve_cam_mask_input(
             img,
-            data/wudi/code_v6,
+            data,
             sample_if_missing=True,
         )
         if cam_mask is None:
@@ -2244,7 +2244,7 @@ class SparseDrive(BaseDetector):
 
         # 3) masked 分支：带梯度的 backbone+neck（student）
         feats_mask_base = self._extract_backbone_neck(
-            img_masked, metas=data/wudi/code_v6, enable_deform=False
+            img_masked, metas=data, enable_deform=False
         )  # list of [B,V,C,H,W]
 
         # 4) full 分支 + SSL 损失（仅在 need_ssl_branch 时执行）
@@ -2255,7 +2255,7 @@ class SparseDrive(BaseDetector):
         if need_ssl_branch:
             with torch.no_grad():
                 feats_full_base = self._extract_backbone_neck(
-                    img_full, metas=data/wudi/code_v6, enable_deform=False
+                    img_full, metas=data, enable_deform=False
                 )
 
             # 5) 自监督损失：只对被 blackout 的视角做特征一致性
