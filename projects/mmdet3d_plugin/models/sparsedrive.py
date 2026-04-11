@@ -2294,7 +2294,7 @@ class SparseDrive(BaseDetector):
         planning_guided_loss = {}
         importance_maps = None
 
-        if cam_mask.any():
+        if cam_mask.any() and self.planning_guided_completion.enable:
             # 使用规划引导补全
             feature_maps_guided, importance_maps = self.planning_guided_completion(
                 feature_maps, cam_mask, ego_trajectory, cam_params
