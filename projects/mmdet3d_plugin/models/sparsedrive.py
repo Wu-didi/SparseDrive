@@ -2226,13 +2226,17 @@ class SparseDrive(BaseDetector):
         # img: [B, V, 3, H, W]
         B, V = img.shape[:2]
 
-        # 1) 保留一份 full images，用于 SSL teacher
-        img_full = img.clone()
+        # 是否启用 SSL 双分支（ssl_weight > 0 或 world_model 存在时才跑 teacher）
+        need_ssl_branch = (self.ssl_weight > 0) or (self.world_model is not None)
+
+        # 1) 保留一份 full images，用于 SSL teacher（仅在需要时）
+        if need_ssl_branch:
+            img_full = img.clone()
 
         # 2) 优先使用外部相机可用性标注；缺失时再采样模拟缺失
         img_masked, cam_mask = self._resolve_cam_mask_input(
             img,
-            data,
+            data/wudi/code_v6,
             sample_if_missing=True,
         )
         if cam_mask is None:
@@ -2240,24 +2244,28 @@ class SparseDrive(BaseDetector):
 
         # 3) masked 分支：带梯度的 backbone+neck（student）
         feats_mask_base = self._extract_backbone_neck(
-            img_masked, metas=data, enable_deform=False
+            img_masked, metas=data/wudi/code_v6, enable_deform=False
         )  # list of [B,V,C,H,W]
 
-        # 4) full 分支：no_grad 的 backbone+neck（teacher）
-        with torch.no_grad():
-            feats_full_base = self._extract_backbone_neck(
-                img_full, metas=data, enable_deform=False
-            )
-
-        # 5) 自监督损失：只对被 blackout 的视角做特征一致性
-        loss_ssl = self.compute_ssl_loss(feats_full_base, feats_mask_base, cam_mask)
-
-        # 5.1) Dreamer 风格潜世界模型监督
+        # 4) full 分支 + SSL 损失（仅在 need_ssl_branch 时执行）
+        feats_full_base = None
+        loss_ssl = feats_mask_base[0].new_tensor(0.0)
         world_loss_dict = None
-        if self.world_model is not None:
-            world_loss_dict = self.world_model(
-                feats_mask_base, feats_full_base, cam_mask
-            )
+
+        if need_ssl_branch:
+            with torch.no_grad():
+                feats_full_base = self._extract_backbone_neck(
+                    img_full, metas=data/wudi/code_v6, enable_deform=False
+                )
+
+            # 5) 自监督损失：只对被 blackout 的视角做特征一致性
+            loss_ssl = self.compute_ssl_loss(feats_full_base, feats_mask_base, cam_mask)
+
+            # 5.1) Dreamer 风格潜世界模型监督
+            if self.world_model is not None:
+                world_loss_dict = self.world_model(
+                    feats_mask_base, feats_full_base, cam_mask
+                )
 
         # ===== 新增：时序补全（运动补偿版本）=====
         # 6) 时序补全：利用历史帧预测缺失相机的特征
