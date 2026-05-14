@@ -1,0 +1,910 @@
+# Copyright (c) 2024. All rights reserved.
+# Motion-Compensated Temporal Completion Module
+# 运动补偿时序补全模块
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import List, Dict, Optional, Tuple
+
+__all__ = ['MotionCompensatedTemporalCompletion']
+
+
+class FeatureQueue:
+    """
+    历史帧特征队列（显存优化版）
+
+    只存储单一尺度的特征，减少显存占用
+    """
+    def __init__(self, queue_length: int = 2, max_time_interval: float = 2.0):
+        """
+        Args:
+            queue_length: 队列长度（保存多少帧历史），默认2帧节省显存
+            max_time_interval: 最大时间间隔（秒），超过则认为历史无效
+        """
+        self.queue_length = queue_length
+        self.max_time_interval = max_time_interval
+        self.reset()
+
+    def reset(self):
+        """重置队列"""
+        self.feature_queue: List[torch.Tensor] = []  # 只存储单一尺度
+        self.T_global_queue: List[np.ndarray] = []
+        self.timestamp_queue: List[np.ndarray] = []
+        self.scene_token_queue: List[List[Optional[str]]] = []
+        self.cam_mask_queue: List[np.ndarray] = []
+        self.batch_size: Optional[int] = None
+
+    def _extract_batch_t_global(self, metas: Dict, batch_size: int) -> np.ndarray:
+        out = np.tile(np.eye(4, dtype=np.float32)[None, ...], (batch_size, 1, 1))
+        img_metas = metas.get("img_metas", None)
+        if isinstance(img_metas, list):
+            for i in range(min(batch_size, len(img_metas))):
+                T_global = img_metas[i].get("T_global", None)
+                if T_global is not None:
+                    out[i] = np.asarray(T_global, dtype=np.float32)
+        return out
+
+    def _extract_batch_timestamps(self, metas: Dict, batch_size: int) -> np.ndarray:
+        out = np.zeros(batch_size, dtype=np.float32)
+        timestamp = metas.get("timestamp", None)
+        if isinstance(timestamp, torch.Tensor):
+            ts = timestamp.detach().cpu().float().view(-1).numpy()
+            if ts.size == 1:
+                out[:] = float(ts[0])
+            else:
+                out[:min(batch_size, ts.size)] = ts[:min(batch_size, ts.size)]
+            return out
+        if isinstance(timestamp, (list, tuple, np.ndarray)):
+            ts = np.asarray(timestamp, dtype=np.float32).reshape(-1)
+            if ts.size == 1:
+                out[:] = float(ts[0])
+            else:
+                out[:min(batch_size, ts.size)] = ts[:min(batch_size, ts.size)]
+            return out
+        if timestamp is not None:
+            out[:] = float(timestamp)
+            return out
+
+        img_metas = metas.get("img_metas", None)
+        if isinstance(img_metas, list):
+            for i in range(min(batch_size, len(img_metas))):
+                ts = img_metas[i].get("timestamp", 0.0)
+                out[i] = float(ts)
+        return out
+
+    def _extract_scene_tokens(self, metas: Dict, batch_size: int) -> List[Optional[str]]:
+        tokens: List[Optional[str]] = [None for _ in range(batch_size)]
+        img_metas = metas.get("img_metas", None)
+        if isinstance(img_metas, list):
+            for i in range(min(batch_size, len(img_metas))):
+                token = img_metas[i].get("scene_token", None)
+                tokens[i] = str(token) if token is not None else None
+        return tokens
+
+    def _scene_switched(self, prev_tokens: List[Optional[str]], cur_tokens: List[Optional[str]]) -> bool:
+        if len(prev_tokens) != len(cur_tokens):
+            return True
+        for prev, cur in zip(prev_tokens, cur_tokens):
+            if prev is not None and cur is not None and prev != cur:
+                return True
+        return False
+
+    def push(self, feat: torch.Tensor, metas: Dict, cam_mask: Optional[torch.Tensor] = None):
+        """
+        添加新帧到队列（只存储单一尺度特征）
+
+        Args:
+            feat: Tensor [B, V, C, H, W]，单一尺度特征
+            metas: 包含 'img_metas' 的字典
+            cam_mask: Tensor [B, V]，True 表示该相机在当前帧缺失
+        """
+        if metas is None:
+            metas = {}
+        elif not isinstance(metas, dict):
+            metas = {"img_metas": metas} if isinstance(metas, list) else {}
+
+        batch_size = feat.shape[0]
+        num_cams = feat.shape[1]
+        T_global = self._extract_batch_t_global(metas, batch_size)
+        timestamp = self._extract_batch_timestamps(metas, batch_size)
+        scene_tokens = self._extract_scene_tokens(metas, batch_size)
+        if cam_mask is None:
+            cam_mask_np = np.zeros((batch_size, num_cams), dtype=np.bool_)
+        else:
+            if isinstance(cam_mask, torch.Tensor):
+                cam_mask_t = cam_mask.detach().cpu().to(dtype=torch.bool)
+            else:
+                cam_mask_t = torch.as_tensor(cam_mask, dtype=torch.bool)
+            if cam_mask_t.dim() == 1:
+                cam_mask_t = cam_mask_t.unsqueeze(0).expand(batch_size, -1)
+            if cam_mask_t.dim() != 2:
+                raise ValueError("cam_mask should be [B, V]")
+            if cam_mask_t.shape[0] == 1 and batch_size > 1:
+                cam_mask_t = cam_mask_t.expand(batch_size, -1)
+            if cam_mask_t.shape != (batch_size, num_cams):
+                raise ValueError("cam_mask shape should match feature batch and camera count")
+            cam_mask_np = cam_mask_t.numpy().astype(np.bool_, copy=True)
+
+        # 场景切换检测：batch size 改变 / scene 改变 / 时间间隔过大都清空队列
+        if self.batch_size is not None and self.batch_size != batch_size:
+            self.reset()
+        if len(self.timestamp_queue) > 0:
+            prev_ts = self.timestamp_queue[-1]
+            if prev_ts.shape[0] != batch_size:
+                self.reset()
+            else:
+                time_diff = np.abs(timestamp - prev_ts)
+                if np.any(time_diff > self.max_time_interval):
+                    self.reset()
+        if len(self.scene_token_queue) > 0:
+            if self._scene_switched(self.scene_token_queue[-1], scene_tokens):
+                self.reset()
+
+        # 添加到队列（detach 避免梯度累积）
+        self.feature_queue.append(feat.detach())
+        self.T_global_queue.append(T_global.copy())
+        self.timestamp_queue.append(timestamp)
+        self.scene_token_queue.append(scene_tokens)
+        self.cam_mask_queue.append(cam_mask_np)
+        self.batch_size = batch_size
+
+        # 保持队列长度
+        if len(self.feature_queue) > self.queue_length:
+            self.feature_queue.pop(0)
+            self.T_global_queue.pop(0)
+            self.timestamp_queue.pop(0)
+            self.scene_token_queue.pop(0)
+            self.cam_mask_queue.pop(0)
+
+    def get(self) -> Tuple[List[torch.Tensor], List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
+        """获取历史特征和元数据"""
+        return self.feature_queue, self.T_global_queue, self.timestamp_queue, self.cam_mask_queue
+
+    def __len__(self):
+        return len(self.feature_queue)
+
+
+class ImageLevelMotionWarp(nn.Module):
+    """
+    图像级运动补偿 Warp
+
+    使用多深度假设 + 可学习残差偏移的方式进行特征对齐
+
+    核心流程：
+    1. 在多个假设深度反投影到 3D
+    2. 通过 T_temp2cur 变换到当前帧
+    3. 投影回像素坐标，得到 base_grid
+    4. 加上可学习的残差偏移
+    5. 使用 grid_sample 进行 warp
+    """
+    def __init__(self,
+                 embed_dims: int = 256,
+                 reference_depths: List[float] = [5, 10, 20, 40],
+                 depth_weights: List[float] = None,
+                 learnable_offset: bool = True,
+                 offset_scale: float = 0.1):
+        """
+        Args:
+            embed_dims: 特征通道数
+            reference_depths: 参考深度列表（米）
+            depth_weights: 深度权重（默认远处权重低）
+            learnable_offset: 是否使用可学习偏移
+            offset_scale: 偏移缩放因子（防止初期偏移过大）
+        """
+        super().__init__()
+        self.reference_depths = reference_depths
+        self.learnable_offset = learnable_offset
+        self.offset_scale = offset_scale
+
+        # 深度权重（近处权重高，远处权重低）
+        if depth_weights is None:
+            weights = [1.0 / (d ** 0.5) for d in reference_depths]
+            total = sum(weights)
+            depth_weights = [w / total for w in weights]
+        self.register_buffer('depth_weights', torch.tensor(depth_weights, dtype=torch.float32))
+
+        # 可学习的残差偏移网络
+        if learnable_offset:
+            self.offset_net = nn.Sequential(
+                nn.Conv2d(embed_dims, embed_dims // 2, 3, padding=1, bias=False),
+                nn.BatchNorm2d(embed_dims // 2),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(embed_dims // 2, 2, 3, padding=1),  # 输出 [dx, dy]
+            )
+            # 小值初始化，使初始偏移接近零
+            nn.init.zeros_(self.offset_net[-1].weight)
+            nn.init.zeros_(self.offset_net[-1].bias)
+
+    def compute_base_grid(self,
+                          T_temp2cur: torch.Tensor,
+                          lidar2img: torch.Tensor,
+                          H: int, W: int,
+                          img_shape: Tuple[int, int]) -> torch.Tensor:
+        """
+        计算基础 warp grid（多深度假设加权）
+
+        Args:
+            T_temp2cur: [B, 4, 4] 历史帧 -> 当前帧变换
+            lidar2img: [B, 4, 4] lidar -> image 投影矩阵
+            H, W: 特征图尺寸
+            img_shape: 原始图像尺寸 (H_img, W_img)
+
+        Returns:
+            grid: [B, H, W, 2] 归一化采样网格
+        """
+        B = T_temp2cur.shape[0]
+        device = T_temp2cur.device
+        H_img, W_img = img_shape
+
+        # 计算特征图到图像的缩放比例
+        scale_h = H_img / H
+        scale_w = W_img / W
+
+        # 创建特征图坐标网格（像素中心）
+        y_feat = torch.arange(H, device=device, dtype=torch.float32)
+        x_feat = torch.arange(W, device=device, dtype=torch.float32)
+        yy, xx = torch.meshgrid(y_feat, x_feat, indexing='ij')
+        xx_img = (xx + 0.5) * scale_w
+        yy_img = (yy + 0.5) * scale_h
+        ones = torch.ones_like(xx_img)
+
+        # 使用真实投影矩阵反投影，而不是启发式 FOV 近似
+        inv_lidar2img = torch.linalg.pinv(lidar2img)  # [B, 4, 4]
+
+        # 收集不同深度的采样点
+        grids = []
+        for depth in self.reference_depths:
+            depth_map = torch.full_like(xx_img, float(depth))
+
+            # p_img_h = [u*z, v*z, z, 1]
+            pix_homo = torch.stack(
+                [xx_img * depth_map, yy_img * depth_map, depth_map, ones],
+                dim=-1,
+            )  # [H, W, 4]
+            pix_homo = pix_homo.unsqueeze(0).expand(B, -1, -1, -1).contiguous()  # [B, H, W, 4]
+            pix_homo = pix_homo.view(B, -1, 4)  # [B, H*W, 4]
+
+            # 当前帧相机像素 -> 历史帧 lidar
+            pts_hist_lidar = torch.bmm(pix_homo, inv_lidar2img.transpose(1, 2))  # [B, H*W, 4]
+            # 历史帧 lidar -> 当前帧 lidar
+            pts_cur_lidar = torch.bmm(pts_hist_lidar, T_temp2cur.transpose(1, 2))
+            # 当前帧 lidar -> 当前帧像素
+            pts_cur_img = torch.bmm(pts_cur_lidar, lidar2img.transpose(1, 2)).view(B, H, W, 4)
+
+            depth_proj = pts_cur_img[..., 2:3].clamp(min=1e-3)
+            pts_2d = pts_cur_img[..., :2] / depth_proj  # [B, H, W, 2]
+
+            grid = torch.stack(
+                [pts_2d[..., 0] / W_img * 2 - 1, pts_2d[..., 1] / H_img * 2 - 1],
+                dim=-1,
+            )  # [B, H, W, 2]
+            grids.append(grid)
+
+        # 加权融合
+        grids = torch.stack(grids, dim=0)  # [num_depths, B, H, W, 2]
+        weights = self.depth_weights.view(-1, 1, 1, 1, 1)  # [num_depths, 1, 1, 1, 1]
+        base_grid = (grids * weights).sum(dim=0)  # [B, H, W, 2]
+
+        return base_grid
+
+    def forward(self,
+                feat: torch.Tensor,
+                T_temp2cur: torch.Tensor,
+                lidar2img: torch.Tensor,
+                img_shape: Tuple[int, int]) -> torch.Tensor:
+        """
+        对单个特征进行运动补偿 warp
+
+        Args:
+            feat: [B, C, H, W] 历史帧特征
+            T_temp2cur: [B, 4, 4] 历史帧 -> 当前帧变换
+            lidar2img: [B, 4, 4] lidar -> image 投影矩阵
+            img_shape: 原始图像尺寸
+
+        Returns:
+            warped: [B, C, H, W] 对齐后的特征
+        """
+        B, C, H, W = feat.shape
+
+        # 计算基础 grid
+        base_grid = self.compute_base_grid(T_temp2cur, lidar2img, H, W, img_shape)
+
+        # 可学习偏移
+        if self.learnable_offset:
+            offset = self.offset_net(feat)  # [B, 2, H, W]
+            offset = offset.permute(0, 2, 3, 1)  # [B, H, W, 2]
+            offset = offset * self.offset_scale  # 缩放
+            grid = base_grid + offset
+        else:
+            grid = base_grid
+
+        # 限制 grid 范围，避免采样到图像外太远
+        grid = grid.clamp(-2, 2)
+
+        # Warp
+        warped = F.grid_sample(
+            feat, grid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=True
+        )
+
+        return warped
+
+
+class TemporalCrossAttention(nn.Module):
+    """
+    时序跨相机注意力（显存优化版）
+
+    特点：
+    1. 支持跨相机历史融合（失效相机可从所有相机历史获取信息）
+    2. 对 Key/Value 做空间下采样，大幅减少显存
+    3. 包含空间、时间、相机位置编码
+    """
+    def __init__(self,
+                 embed_dims: int = 256,
+                 num_heads: int = 8,
+                 num_cameras: int = 6,
+                 num_history: int = 3,
+                 dropout: float = 0.1,
+                 kv_downsample: int = 4,  # Key/Value 空间下采样倍数
+                 use_flash_attn: bool = True):
+        """
+        Args:
+            embed_dims: 特征维度
+            num_heads: 注意力头数
+            num_cameras: 相机数量
+            num_history: 历史帧数量
+            dropout: Dropout 比例
+            kv_downsample: Key/Value 的空间下采样倍数（减少显存）
+            use_flash_attn: 是否使用 FlashAttention（需要安装）
+        """
+        super().__init__()
+        self.embed_dims = embed_dims
+        self.num_heads = num_heads
+        self.num_cameras = num_cameras
+        self.num_history = num_history
+        self.use_flash_attn = use_flash_attn
+        self.kv_downsample = kv_downsample
+
+        # 可学习的 Query 初始化
+        self.query_embed = nn.Parameter(torch.randn(1, embed_dims, 1, 1) * 0.02)
+
+        # 位置编码
+        self.camera_pos_embed = nn.Parameter(torch.randn(num_cameras, embed_dims) * 0.02)
+        self.temporal_pos_embed = nn.Parameter(torch.randn(num_history, embed_dims) * 0.02)
+
+        # 空间位置编码（可学习的 2D 位置）
+        self.spatial_pos_embed = nn.Parameter(torch.randn(1, embed_dims, 1, 1) * 0.02)
+
+        # 相机距离编码（用于跨相机注意力）
+        self.register_buffer('camera_adjacency', self._create_camera_adjacency())
+
+        # Key/Value 空间下采样
+        if kv_downsample > 1:
+            self.kv_pool = nn.AdaptiveAvgPool2d(None)  # 动态设置
+
+        # 注意力层
+        self.q_proj = nn.Linear(embed_dims, embed_dims)
+        self.k_proj = nn.Linear(embed_dims, embed_dims)
+        self.v_proj = nn.Linear(embed_dims, embed_dims)
+        self.out_proj = nn.Linear(embed_dims, embed_dims)
+
+        # Dropout
+        self.dropout = nn.Dropout(dropout)
+
+        # 输出 LayerNorm
+        self.norm = nn.LayerNorm(embed_dims)
+
+    def _create_camera_adjacency(self) -> torch.Tensor:
+        """
+        创建相机邻接矩阵
+
+        nuScenes 相机布局：
+        0: FRONT, 1: FRONT_LEFT, 2: FRONT_RIGHT,
+        3: BACK_LEFT, 4: BACK_RIGHT, 5: BACK
+        """
+        adjacency = torch.ones(6, 6) * 0.5
+        adjacency.fill_diagonal_(1.0)
+        adjacency[0, 1] = adjacency[1, 0] = 0.8
+        adjacency[0, 2] = adjacency[2, 0] = 0.8
+        adjacency[5, 3] = adjacency[3, 5] = 0.8
+        adjacency[5, 4] = adjacency[4, 5] = 0.8
+        adjacency[1, 3] = adjacency[3, 1] = 0.7
+        adjacency[2, 4] = adjacency[4, 2] = 0.7
+        return adjacency
+
+    def forward(self,
+                query_cam_idx: int,
+                history_feats: torch.Tensor,
+                history_valid_mask: Optional[torch.Tensor],
+                H: int, W: int) -> torch.Tensor:
+        """
+        对单个失效相机进行补全（显存优化版）
+
+        Args:
+            query_cam_idx: 失效相机索引
+            history_feats: [B, V, T, C, H, W] 所有相机的历史特征（已 warp）
+            history_valid_mask: [B, V, T]，True 表示对应历史 token 可用
+            H, W: 输出特征图尺寸
+
+        Returns:
+            completed: [B, C, H, W] 补全后的特征
+        """
+        B, V, T, C, H_in, W_in = history_feats.shape
+        device = history_feats.device
+
+        # 1. 构建 Query（可学习初始化）
+        query = self.query_embed.expand(B, -1, H, W)
+        query = query + self.camera_pos_embed[query_cam_idx].view(1, -1, 1, 1)
+        query = query + self.spatial_pos_embed.expand(B, -1, H, W)
+        query_flat = query.flatten(2).permute(0, 2, 1)  # [B, H*W, C]
+
+        # 2. 构建 Key/Value（对历史特征做空间下采样以节省显存）
+        # 下采样尺寸
+        H_kv = max(H_in // self.kv_downsample, 1)
+        W_kv = max(W_in // self.kv_downsample, 1)
+
+        # 重塑并下采样
+        kv = history_feats.view(B * V * T, C, H_in, W_in)
+        if self.kv_downsample > 1:
+            kv = F.adaptive_avg_pool2d(kv, (H_kv, W_kv))  # [B*V*T, C, H_kv, W_kv]
+        kv = kv.view(B, V, T, C, H_kv, W_kv)
+
+        # 添加位置编码（在下采样后添加，节省计算）
+        for t in range(T):
+            kv[:, :, t] = kv[:, :, t] + self.temporal_pos_embed[t].view(1, 1, -1, 1, 1)
+        for v in range(V):
+            kv[:, v] = kv[:, v] + self.camera_pos_embed[v].view(1, 1, -1, 1, 1)
+
+        # 展平
+        kv_flat = kv.permute(0, 1, 2, 4, 5, 3).reshape(B, V * T * H_kv * W_kv, C)
+
+        kv_valid_flat = None
+        has_valid_history = None
+        if history_valid_mask is not None:
+            history_valid_mask = history_valid_mask.to(device=device, dtype=torch.bool)
+            if history_valid_mask.shape != (B, V, T):
+                raise ValueError("history_valid_mask should be [B, V, T]")
+            kv_valid_flat = (
+                history_valid_mask.view(B, V, T, 1, 1)
+                .expand(-1, -1, -1, H_kv, W_kv)
+                .reshape(B, V * T * H_kv * W_kv)
+            )
+            has_valid_history = kv_valid_flat.any(dim=-1, keepdim=True)
+
+        # 3. 投影
+        q = self.q_proj(query_flat)  # [B, H*W, C]
+        k = self.k_proj(kv_flat)      # [B, V*T*H_kv*W_kv, C]
+        v_out = self.v_proj(kv_flat)
+
+        # 4. 计算注意力
+        scale = (C // self.num_heads) ** -0.5
+
+        # 重塑为多头
+        q = q.view(B, H * W, self.num_heads, C // self.num_heads).transpose(1, 2)
+        k = k.view(B, -1, self.num_heads, C // self.num_heads).transpose(1, 2)
+        v_out = v_out.view(B, -1, self.num_heads, C // self.num_heads).transpose(1, 2)
+
+        # 相机邻接先验（更偏向同向/邻近相机）
+        cam_adj = self.camera_adjacency.to(device=device, dtype=q.dtype)
+        query_row_idx = min(query_cam_idx, cam_adj.shape[0] - 1)
+        cam_row = cam_adj[query_row_idx, :min(V, cam_adj.shape[1])]
+        if cam_row.shape[0] < V:
+            cam_row = torch.cat(
+                [cam_row, torch.ones(V - cam_row.shape[0], device=device, dtype=q.dtype) * 0.5],
+                dim=0,
+            )
+        key_cam_weight = cam_row.repeat_interleave(T * H_kv * W_kv).clamp(min=1e-4)  # [L]
+        attn_bias = key_cam_weight.log().view(1, 1, 1, -1)  # [1,1,1,L]
+        if kv_valid_flat is not None:
+            invalid_bias = (~kv_valid_flat).to(dtype=q.dtype).view(B, 1, 1, -1) * q.new_tensor(-1e4)
+            attn_bias = attn_bias + invalid_bias
+
+        # 注意力分数（可选 SDPA）
+        if self.use_flash_attn and hasattr(F, "scaled_dot_product_attention"):
+            dropout_p = self.dropout.p if self.training else 0.0
+            out = F.scaled_dot_product_attention(
+                q, k, v_out, attn_mask=attn_bias, dropout_p=dropout_p, is_causal=False
+            )
+        else:
+            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+            attn = attn + attn_bias
+            attn = F.softmax(attn, dim=-1)
+            attn = self.dropout(attn)
+            out = torch.matmul(attn, v_out)
+
+        out = out.transpose(1, 2).reshape(B, H * W, C)
+
+        # 输出投影
+        out = self.out_proj(out)
+        out = self.norm(out)
+        if has_valid_history is not None:
+            out = out * has_valid_history.to(dtype=out.dtype).view(B, 1, 1)
+        out = out.permute(0, 2, 1).reshape(B, C, H, W)
+
+        return out
+
+
+class SpatialDecoder(nn.Module):
+    """
+    空间细化解码器
+
+    保持空间结构，使用残差块进行逐像素细化
+    """
+    def __init__(self, embed_dims: int = 256, hidden_dims: int = 256, num_res_blocks: int = 2):
+        super().__init__()
+
+        layers = [
+            nn.Conv2d(embed_dims, hidden_dims, 3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_dims),
+            nn.ReLU(inplace=True),
+        ]
+
+        # 残差块
+        for _ in range(num_res_blocks):
+            layers.append(ResBlock(hidden_dims))
+
+        # 输出层
+        layers.extend([
+            nn.Conv2d(hidden_dims, embed_dims, 1),
+        ])
+
+        self.decoder = nn.Sequential(*layers)
+
+        # 小值初始化最后一层
+        nn.init.normal_(self.decoder[-1].weight, mean=0, std=0.01)
+        nn.init.zeros_(self.decoder[-1].bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.decoder(x)
+
+
+class ResBlock(nn.Module):
+    """残差块"""
+    def __init__(self, channels: int):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.relu(x + self.conv(x))
+
+
+class MotionCompensatedTemporalCompletion(nn.Module):
+    """
+    运动补偿时序补全模块（显存优化版）
+
+    显存优化策略：
+    1. 只存储和处理最粗尺度特征（scale_idx=-1）
+    2. 历史队列长度减少到 2 帧
+    3. Key/Value 做 4x 空间下采样
+    4. 补全结果上采样后应用到所有尺度
+
+    输入：
+        current_feats: List[Tensor] 当前帧多尺度特征，每个 [B, V, C, H, W]
+        cam_mask: [B, V] bool 失效相机掩码
+        metas: dict 包含 T_global, lidar2img 等
+
+    输出：
+        completed_feats: List[Tensor] 补全后的特征
+    """
+    def __init__(self,
+                 ch_per_scale: List[int],
+                 embed_dims: int = 256,
+                 num_heads: int = 8,
+                 queue_length: int = 2,  # 减少到 2 帧
+                 num_cameras: int = 6,
+                 reference_depths: List[float] = [10, 30],  # 减少深度假设
+                 kv_downsample: int = 4,  # Key/Value 下采样
+                 use_flash_attn: bool = False,
+                 cross_scale_residual: float = 0.5,
+                 enable: bool = True):
+        super().__init__()
+        self.enable = enable
+        self.num_scales = len(ch_per_scale)
+        self.num_cameras = num_cameras
+        self.queue_length = queue_length
+        self.cross_scale_residual = float(cross_scale_residual)
+
+        if not enable:
+            return
+
+        # 只处理最粗尺度（最后一个尺度，显存最小）
+        self.process_scale_idx = -1
+        process_ch = ch_per_scale[self.process_scale_idx]
+
+        # 特征队列（只存储单一尺度）
+        self.feature_queue = FeatureQueue(queue_length=queue_length)
+
+        # 单一尺度的运动 warp 模块
+        self.motion_warp = ImageLevelMotionWarp(
+            embed_dims=process_ch,
+            reference_depths=reference_depths,
+            learnable_offset=True,
+        )
+
+        # 时序跨相机注意力
+        self.temporal_attention = TemporalCrossAttention(
+            embed_dims=embed_dims,
+            num_heads=num_heads,
+            num_cameras=num_cameras,
+            num_history=queue_length,
+            kv_downsample=kv_downsample,
+            use_flash_attn=use_flash_attn,
+        )
+
+        # 特征适配层
+        self.feat_adapter = nn.Conv2d(process_ch, embed_dims, 1) if process_ch != embed_dims else nn.Identity()
+        self.out_adapter = nn.Conv2d(embed_dims, process_ch, 1) if process_ch != embed_dims else nn.Identity()
+
+        # missing-aware 表征：显式区分有效/缺失视角
+        self.valid_cam_embed = nn.Parameter(torch.zeros(1, 1, process_ch, 1, 1))
+        self.missing_cam_embed = nn.Parameter(torch.zeros(1, 1, process_ch, 1, 1))
+        nn.init.zeros_(self.valid_cam_embed)
+        nn.init.normal_(self.missing_cam_embed, mean=0, std=0.02)
+
+        # 空间解码器（轻量版）
+        self.spatial_decoder = nn.Sequential(
+            nn.Conv2d(embed_dims, embed_dims, 3, padding=1, bias=False),
+            nn.BatchNorm2d(embed_dims),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(embed_dims, embed_dims, 1),
+        )
+        nn.init.normal_(self.spatial_decoder[-1].weight, mean=0, std=0.01)
+        nn.init.zeros_(self.spatial_decoder[-1].bias)
+
+        # 条件补全：当前有效视角 + 历史上下文
+        self.cond_fusion = nn.Sequential(
+            nn.Conv2d(embed_dims * 2, embed_dims, 1, bias=False),
+            nn.BatchNorm2d(embed_dims),
+            nn.ReLU(inplace=True),
+        )
+        self.conditional_completion = nn.Sequential(
+            nn.Conv2d(embed_dims * 2, embed_dims, 3, padding=1, bias=False),
+            nn.BatchNorm2d(embed_dims),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(embed_dims, embed_dims, 1),
+        )
+        nn.init.normal_(self.conditional_completion[-1].weight, mean=0, std=0.01)
+        nn.init.zeros_(self.conditional_completion[-1].bias)
+
+        # 门控融合
+        self.gate = nn.Sequential(
+            nn.Conv2d(process_ch * 2, process_ch // 4, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(process_ch // 4, 1, 1),
+            nn.Sigmoid()
+        )
+        nn.init.constant_(self.gate[-2].bias, -2.0)
+
+        # 默认图像尺寸
+        self.img_shape = (900, 1600)
+
+    def _extract_batch_t_global(self, metas: Dict, batch_size: int, device) -> torch.Tensor:
+        T_global = torch.eye(4, dtype=torch.float32, device=device).unsqueeze(0).repeat(batch_size, 1, 1)
+        img_metas = metas.get("img_metas", None)
+        if isinstance(img_metas, list):
+            for i in range(min(batch_size, len(img_metas))):
+                cur = img_metas[i].get("T_global", None)
+                if cur is not None:
+                    T_global[i] = torch.as_tensor(cur, dtype=torch.float32, device=device)
+        return T_global
+
+    def _extract_batch_lidar2img(self, metas: Dict, batch_size: int, num_cams: int, device) -> torch.Tensor:
+        out = torch.eye(4, dtype=torch.float32, device=device).view(1, 1, 4, 4).repeat(batch_size, num_cams, 1, 1)
+        img_metas = metas.get("img_metas", None)
+        if not isinstance(img_metas, list):
+            return out
+
+        for b in range(min(batch_size, len(img_metas))):
+            cur = img_metas[b].get("lidar2img", None)
+            if cur is None:
+                continue
+            cur_t = torch.as_tensor(cur, dtype=torch.float32, device=device)
+            if cur_t.dim() == 2:
+                out[b] = cur_t.unsqueeze(0).expand(num_cams, -1, -1)
+            elif cur_t.dim() == 3:
+                valid = min(num_cams, cur_t.shape[0])
+                out[b, :valid] = cur_t[:valid]
+        return out
+
+    def compute_T_temp2cur(self, T_global_hist: torch.Tensor, T_global_cur: torch.Tensor) -> torch.Tensor:
+        """计算历史帧到当前帧的变换矩阵（batch 版本）"""
+        try:
+            T_global_inv_cur = torch.linalg.inv(T_global_cur)
+        except RuntimeError:
+            T_global_inv_cur = torch.linalg.pinv(T_global_cur)
+        return torch.bmm(T_global_inv_cur, T_global_hist)
+
+    def forward(self,
+                current_feats: List[torch.Tensor],
+                cam_mask: torch.Tensor,
+                metas: Dict) -> List[torch.Tensor]:
+        """
+        前向传播（显存优化版）
+
+        只处理最粗尺度，补全结果应用到所有尺度
+        """
+        if not self.enable:
+            return current_feats
+
+        if metas is None:
+            metas = {}
+        elif not isinstance(metas, dict):
+            metas = {"img_metas": metas} if isinstance(metas, list) else {}
+
+        # 获取要处理的尺度特征
+        feat_process_raw = current_feats[self.process_scale_idx]  # [B, V, C, H, W]
+        B, V, C, H, W = feat_process_raw.shape
+        device = feat_process_raw.device
+
+        if cam_mask is None or not cam_mask.any():
+            # 没有失效相机，更新队列后直接返回
+            with torch.no_grad():
+                self.feature_queue.push(feat_process_raw, metas)
+            return current_feats
+        cam_mask = cam_mask.to(device=device, dtype=torch.bool)
+
+        # missing-aware 表征：显式注入缺失状态
+        cam_mask_float = cam_mask.view(B, V, 1, 1, 1).to(dtype=feat_process_raw.dtype)
+        feat_process = (
+            feat_process_raw
+            + (1.0 - cam_mask_float) * self.valid_cam_embed
+            + cam_mask_float * self.missing_cam_embed
+        )
+
+        # 获取历史特征
+        history_feats, T_global_queue, _, history_mask_queue = self.feature_queue.get()
+
+        if len(history_feats) == 0:
+            # 没有历史帧，更新队列后返回原始特征
+            with torch.no_grad():
+                self.feature_queue.push(feat_process_raw, metas, cam_mask=cam_mask)
+            return current_feats
+
+        # 获取当前帧的变换矩阵（batch）
+        img_metas = metas.get('img_metas', None)
+        if img_metas is None or not isinstance(img_metas, list) or len(img_metas) == 0:
+            # 没有有效的 img_metas，跳过时序补全
+            with torch.no_grad():
+                self.feature_queue.push(feat_process_raw, metas, cam_mask=cam_mask)
+            return current_feats
+
+        T_global_cur = self._extract_batch_t_global(metas, B, device)  # [B, 4, 4]
+        lidar2img = self._extract_batch_lidar2img(metas, B, V, device)  # [B, V, 4, 4]
+
+        # 计算 T_temp2cur 并 warp 历史特征
+        warped_history = []
+        history_valid_masks = []
+        for t, (hist_feat, T_global_hist) in enumerate(zip(history_feats, T_global_queue)):
+            if hist_feat.shape[0] != B:
+                continue
+
+            T_global_hist = torch.as_tensor(T_global_hist, dtype=torch.float32, device=device)
+            if T_global_hist.dim() == 2:
+                T_global_hist = T_global_hist.unsqueeze(0).expand(B, -1, -1)
+            if T_global_hist.shape[0] != B:
+                continue
+            T_temp2cur = self.compute_T_temp2cur(T_global_hist, T_global_cur)
+
+            # 对每个相机 warp
+            warped_cams = []
+            for v in range(V):
+                warped = self.motion_warp(hist_feat[:, v], T_temp2cur, lidar2img[:, v], self.img_shape)
+                warped_cams.append(warped)
+            hist_cam_mask = history_mask_queue[t] if t < len(history_mask_queue) else None
+            if hist_cam_mask is None:
+                hist_cam_mask_t = torch.zeros((B, V), dtype=torch.bool, device=device)
+            else:
+                hist_cam_mask_t = torch.as_tensor(hist_cam_mask, dtype=torch.bool, device=device)
+                if hist_cam_mask_t.dim() == 1:
+                    hist_cam_mask_t = hist_cam_mask_t.unsqueeze(0).expand(B, -1)
+                if hist_cam_mask_t.shape[0] == 1 and B > 1:
+                    hist_cam_mask_t = hist_cam_mask_t.expand(B, -1)
+                if hist_cam_mask_t.shape != (B, V):
+                    continue
+            warped_hist = torch.stack(warped_cams, dim=1)
+            warped_history.append(warped_hist)
+            history_valid_masks.append(~hist_cam_mask_t)
+
+        if len(warped_history) == 0:
+            with torch.no_grad():
+                self.feature_queue.push(feat_process_raw, metas, cam_mask=cam_mask)
+            return current_feats
+
+        # 堆叠历史帧 [B, V, T, C, H, W]
+        warped_history = torch.stack(warped_history, dim=2)
+        T_actual = warped_history.shape[2]
+        history_valid = torch.stack(history_valid_masks, dim=2)
+
+        # 适配到 embed_dims
+        warped_adapted = self.feat_adapter(warped_history.view(B * V * T_actual, C, H, W))
+        embed_dims = warped_adapted.shape[1]
+        warped_adapted = warped_adapted.view(B, V, T_actual, embed_dims, H, W)
+
+        # 当前帧 valid-view 条件
+        current_adapted = self.feat_adapter(feat_process.view(B * V, C, H, W)).view(B, V, embed_dims, H, W)
+        valid_mask = (~cam_mask).view(B, V, 1, 1, 1).to(dtype=current_adapted.dtype)
+        valid_count = valid_mask.sum(dim=1).clamp(min=1.0)
+        cond_current = (current_adapted * valid_mask).sum(dim=1) / valid_count  # [B, C, H, W]
+
+        # 历史条件（仅聚合有效视角）
+        valid_mask_hist = history_valid.view(B, V, T_actual, 1, 1, 1).to(dtype=warped_adapted.dtype)
+        hist_count = valid_mask_hist.sum(dim=(1, 2)).clamp(min=1.0)
+        cond_history = (warped_adapted * valid_mask_hist).sum(dim=1).sum(dim=1) / hist_count
+        cond_context = self.cond_fusion(torch.cat([cond_current, cond_history], dim=1))
+
+        # 对每个失效相机进行补全
+        feat_out = feat_process_raw.clone()
+
+        for v in range(V):
+            missing_mask = cam_mask[:, v]
+            if not missing_mask.any():
+                continue
+
+            # 时序注意力
+            completed = self.temporal_attention(
+                query_cam_idx=v,
+                history_feats=warped_adapted,
+                history_valid_mask=history_valid,
+                H=H, W=W,
+            )
+
+            # 条件补全：missing-view-like + (valid-view + history) 条件
+            cond_input = torch.cat([current_adapted[:, v], cond_context], dim=1)
+            completed = completed + self.conditional_completion(cond_input)
+
+            # 空间解码
+            completed = self.spatial_decoder(completed)
+
+            # 适配回原始通道
+            completed = self.out_adapter(completed)
+
+            # 门控融合
+            gate_input = torch.cat([feat_process_raw[:, v], completed], dim=1)
+            gate = self.gate(gate_input)
+            fused = feat_process_raw[:, v] * (1 - gate) + completed * gate
+
+            # 只替换失效的 batch
+            mask = missing_mask.view(B, 1, 1, 1).float()
+            feat_out[:, v] = feat_out[:, v] * (1 - mask) + fused * mask
+
+        # 更新历史队列
+        with torch.no_grad():
+            # 将补全结果写入记忆，减少缺失特征在队列中传播
+            self.feature_queue.push(feat_out, metas, cam_mask=cam_mask)
+
+        # 构建输出：只更新处理的尺度
+        outputs = list(current_feats)
+        outputs[self.process_scale_idx] = feat_out
+        if self.cross_scale_residual > 0:
+            delta = (feat_out - feat_process_raw).view(B * V, C, H, W)
+            miss = cam_mask.view(B, V, 1, 1, 1).to(dtype=feat_process_raw.dtype)
+            for scale_idx, feat_scale in enumerate(current_feats):
+                if scale_idx == self.process_scale_idx:
+                    continue
+                if feat_scale.shape[2] != C:
+                    continue
+                H_s, W_s = feat_scale.shape[-2:]
+                delta_scale = F.interpolate(
+                    delta,
+                    size=(H_s, W_s),
+                    mode="bilinear",
+                    align_corners=False,
+                ).view(B, V, C, H_s, W_s)
+                outputs[scale_idx] = feat_scale + delta_scale * miss * self.cross_scale_residual
+
+        return outputs
+
+    def reset(self):
+        """重置历史队列"""
+        if hasattr(self, 'feature_queue'):
+            self.feature_queue.reset()

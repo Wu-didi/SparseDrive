@@ -299,6 +299,7 @@ class NuScenes3DDataset(Dataset):
         info = self.data_infos[index]
         input_dict = dict(
             token=info["token"],
+            scene_token=info["scene_token"],
             map_location=info["map_location"],
             pts_filename=info["lidar_path"],
             sweeps=info["sweeps"],
